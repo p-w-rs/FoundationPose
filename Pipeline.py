@@ -9,9 +9,9 @@ from LMODataLoader import LMODataLoader
 from DepthProcessor import DepthProcessor
 from PoseGenerator import PoseProposalGenerator
 from ModelInterface import ModelInterface
-from check_pose_diversity import check_pose_diversity
 from MeshRenderer import MeshRenderer
 from CropUtils import compute_crop_window_tf_batch, warp_perspective_batch
+from DebugTest.CheckDiversity import check_pose_diversity
 
 class FoundationPosePipeline:
     """
