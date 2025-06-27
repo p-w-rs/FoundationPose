@@ -1,0 +1,16 @@
+[project]
+name = "6dposedif"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "matplotlib>=3.10.3",
+    "numpy<2",
+    "onnx>=1.18.0",
+    "onnxruntime-silicon>=1.16.3",
+    "open3d>=0.19.0",
+    "opencv-python>=4.11.0.86",
+    "torch>=2.7.1",
+    "trimesh>=4.6.12",
+]
