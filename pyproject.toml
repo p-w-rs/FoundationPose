@@ -5,6 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "diffrp-nvdiffrast>=0.3.3.1",
     "matplotlib>=3.10.3",
     "numpy>=2.3.1",
     "onnx>=1.18.0",

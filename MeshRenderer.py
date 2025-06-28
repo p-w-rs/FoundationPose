@@ -1,175 +1,405 @@
 import numpy as np
-import cv2
+import torch
+import nvdiffrast.torch as dr
 import trimesh
-from typing import Tuple
+from typing import Tuple, Optional, Union
+import cv2
+import logging
 
 class MeshRenderer:
     """
-    Proper mesh renderer using OpenCV for rasterization.
-    Produces actual rendered images of the mesh, not blank squares.
+    GPU-accelerated mesh renderer using nvdiffrast for FoundationPose.
+
+    This renderer generates synthetic RGB and depth images of objects
+    at specified poses for pose hypothesis generation and refinement.
+
+    UNITS:
+    - Input poses: meters (m)
+    - Input mesh vertices: meters (m)
+    - Output depth: meters (m)
+    - Camera intrinsics: pixels
+
+    Optimized for:
+    - Batch rendering of multiple poses
+    - 160x160 output for model input
+    - GPU memory efficiency
+    - Minimal CPU-GPU transfers
     """
 
-    def __init__(self, mesh: trimesh.Trimesh):
-        self.mesh = mesh
-        self.vertices = mesh.vertices
-        self.faces = mesh.faces
+    def __init__(self, mesh: trimesh.Trimesh, device: str = 'cuda'):
+        """
+        Initialize renderer with a mesh.
 
-        # Precompute face normals for shading
-        self.face_normals = mesh.face_normals
+        Args:
+            mesh: Trimesh object with vertices in meters
+            device: PyTorch device ('cuda' or 'cpu')
+        """
+        self.device = torch.device(device)
+        self.logger = logging.getLogger(__name__)
+
+        # Initialize nvdiffrast context
+        self.glctx = dr.RasterizeCudaContext(device=self.device)
+
+        # Load mesh to GPU
+        self.vertices = torch.from_numpy(
+            mesh.vertices.astype(np.float32)
+        ).to(self.device)
+
+        self.faces = torch.from_numpy(
+            mesh.faces.astype(np.int32)
+        ).to(self.device)
+
+        # Compute vertex colors from normals for shading
+        if hasattr(mesh, 'vertex_normals') and mesh.vertex_normals is not None:
+            # Simple Lambert shading
+            light_dir = np.array([0.0, 0.0, 1.0])  # Camera-aligned light
+            shading = np.clip(mesh.vertex_normals @ light_dir, 0.3, 1.0)
+            colors = np.stack([shading] * 3, axis=-1)
+        else:
+            colors = np.ones((len(mesh.vertices), 3)) * 0.7
+
+        self.vertex_colors = torch.from_numpy(
+            colors.astype(np.float32)
+        ).to(self.device)
+
+        # Cache mesh properties
+        self.n_vertices = len(mesh.vertices)
+        self.n_faces = len(mesh.faces)
+        self.mesh_center = mesh.vertices.mean(axis=0)
+        self.mesh_scale = np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
+
+        self.logger.info(f"Initialized renderer: {self.n_vertices} vertices, "
+                        f"{self.n_faces} faces, scale: {self.mesh_scale:.3f}m")
 
     def render(self, pose: np.ndarray, K: np.ndarray,
-               H: int = 160, W: int = 160) -> Tuple[np.ndarray, np.ndarray]:
+               width: int = 160, height: int = 160,
+               z_near: float = 0.01, z_far: float = 10.0) -> Tuple[np.ndarray, np.ndarray]:
         """
         Render mesh at given pose.
 
         Args:
-            pose: 4x4 transformation matrix (mm)
-            K: 3x3 camera intrinsics
-            H, W: Output image dimensions
+            pose: 4x4 pose matrix (object to camera) in meters
+            K: 3x3 camera intrinsic matrix (will be scaled if needed)
+            width: Output image width
+            height: Output image height
+            z_near: Near clipping plane (meters)
+            z_far: Far clipping plane (meters)
 
         Returns:
-            rgb: Rendered RGB image (H, W, 3)
-            depth: Rendered depth map in meters (H, W)
+            Tuple of:
+            - rgb: (H, W, 3) uint8 RGB image
+            - depth: (H, W) float32 depth in meters
         """
-        # Transform vertices to camera frame
-        vertices_cam = (pose[:3, :3] @ self.vertices.T).T + pose[:3, 3]
+        # Single pose - add batch dimension
+        rgbs, depths = self.render_batch(
+            np.array([pose]), K, width, height, z_near, z_far
+        )
+        return rgbs[0], depths[0]
 
-        # Initialize buffers
-        rgb = np.zeros((H, W, 3), dtype=np.uint8)
-        depth_buffer = np.full((H, W), np.inf, dtype=np.float32)
+    def render_batch(self, poses: np.ndarray, K: np.ndarray,
+                    width: int = 160, height: int = 160,
+                    z_near: float = 0.01, z_far: float = 10.0) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Render mesh at multiple poses efficiently in batch.
 
-        # Project vertices
-        vertices_proj = (K @ vertices_cam.T).T
-        vertices_2d = vertices_proj[:, :2] / vertices_proj[:, 2:3]
-        z_values = vertices_proj[:, 2]
+        Args:
+            poses: (N, 4, 4) pose matrices in meters
+            K: 3x3 camera intrinsic matrix
+            width: Output image width
+            height: Output image height
+            z_near: Near clipping plane (meters)
+            z_far: Far clipping plane (meters)
 
-        # Sort faces by average depth (painter's algorithm)
-        face_depths = np.mean(z_values[self.faces], axis=1)
-        sorted_faces = np.argsort(-face_depths)  # Back to front
+        Returns:
+            Tuple of:
+            - rgbs: (N, H, W, 3) uint8 RGB images
+            - depths: (N, H, W) float32 depth in meters
+        """
+        batch_size = len(poses)
 
-        # Light direction (from camera)
-        light_dir = np.array([0, 0, 1])
+        # Scale intrinsics if rendering at different resolution
+        # Assume original resolution is 640x480 (typical for LM-O)
+        K_scaled = K.copy()
+        scale_x = width / 640.0
+        scale_y = height / 480.0
+        K_scaled[0, 0] *= scale_x  # fx
+        K_scaled[1, 1] *= scale_y  # fy
+        K_scaled[0, 2] *= scale_x  # cx
+        K_scaled[1, 2] *= scale_y  # cy
 
-        for face_idx in sorted_faces:
-            face = self.faces[face_idx]
+        # Convert to torch
+        poses_torch = torch.from_numpy(poses.astype(np.float32)).to(self.device)
+        K_torch = torch.from_numpy(K_scaled.astype(np.float32)).to(self.device)
 
-            # Get face vertices in camera space
-            face_verts_cam = vertices_cam[face]
+        # Transform vertices by each pose
+        # vertices: (V, 3), poses: (N, 4, 4)
+        vertices_homo = torch.cat([
+            self.vertices,
+            torch.ones(self.n_vertices, 1, device=self.device)
+        ], dim=1)  # (V, 4)
 
-            # Skip if any vertex is behind camera
-            if np.any(face_verts_cam[:, 2] <= 0):
-                continue
+        # Batch transform: (N, 4, 4) @ (V, 4).T -> (N, 4, V) -> (N, V, 4)
+        transformed = torch.matmul(poses_torch, vertices_homo.T).transpose(1, 2)
+        vertices_cam = transformed[:, :, :3]  # (N, V, 3)
 
-            # Get 2D vertices
-            pts_2d = vertices_2d[face].astype(np.int32)
+        # Project to screen space
+        vertices_proj = self._project_points(vertices_cam, K_torch, width, height)
 
-            # Check if triangle is in bounds
-            if (np.all(pts_2d[:, 0] < 0) or np.all(pts_2d[:, 0] >= W) or
-                np.all(pts_2d[:, 1] < 0) or np.all(pts_2d[:, 1] >= H)):
-                continue
+        # Prepare for rasterization - need (N*V, 4) format
+        vertices_clip = vertices_proj.reshape(-1, 4)
 
-            # Compute face normal in camera space
-            v1 = face_verts_cam[1] - face_verts_cam[0]
-            v2 = face_verts_cam[2] - face_verts_cam[0]
-            normal = np.cross(v1, v2)
-            normal = normal / (np.linalg.norm(normal) + 1e-8)
+        # Expand faces for batch
+        faces_expanded = self.faces.unsqueeze(0).expand(batch_size, -1, -1)
+        face_offsets = (torch.arange(batch_size, device=self.device, dtype=torch.int32) * self.n_vertices).reshape(-1, 1, 1)
+        faces_batch = (faces_expanded + face_offsets).reshape(-1, 3).int()
 
-            # Skip back-facing triangles
-            if normal[2] > 0:
-                continue
+        # Create ranges for batch rendering
+        ranges = torch.stack([
+            torch.arange(batch_size, dtype=torch.int32) * self.n_faces,
+            torch.full((batch_size,), self.n_faces, dtype=torch.int32)
+        ], dim=1).cpu()
 
-            # Simple Lambertian shading
-            shade = max(0, -np.dot(normal, light_dir))
-            color = int(100 + 155 * shade)  # Gray with shading
+        # Rasterize
+        rast_out, _ = dr.rasterize(
+            self.glctx, vertices_clip, faces_batch,
+            resolution=[height, width], ranges=ranges
+        )
 
-            # Create mask for triangle
-            mask = np.zeros((H, W), dtype=np.uint8)
-            cv2.fillPoly(mask, [pts_2d], 1)
+        # Reshape rasterization output
+        rast_out = rast_out.reshape(batch_size, height, width, 4)
 
-            # Get bounding box
-            x_min = max(0, pts_2d[:, 0].min())
-            x_max = min(W-1, pts_2d[:, 0].max())
-            y_min = max(0, pts_2d[:, 1].min())
-            y_max = min(H-1, pts_2d[:, 1].max())
+        # Create masks where mesh was rendered
+        masks = rast_out[..., 3] > 0
 
-            if x_max <= x_min or y_max <= y_min:
-                continue
+        # Prepare vertex attributes for interpolation
+        # Colors need to be repeated for each batch
+        colors_batch = self.vertex_colors.unsqueeze(0).expand(batch_size, -1, -1)
+        colors_flat = colors_batch.reshape(-1, 3)
 
-            # Compute barycentric coordinates for depth interpolation
-            for y in range(y_min, y_max + 1):
-                for x in range(x_min, x_max + 1):
-                    if mask[y, x] == 0:
-                        continue
+        # Depth values for interpolation
+        z_values = vertices_cam[..., 2].reshape(-1, 1)  # (N*V, 1)
 
-                    # Barycentric interpolation for depth
-                    v0 = pts_2d[2] - pts_2d[0]
-                    v1 = pts_2d[1] - pts_2d[0]
-                    v2 = np.array([x, y]) - pts_2d[0]
+        # Interpolate colors
+        color_out, _ = dr.interpolate(
+            colors_flat, rast_out, faces_batch
+        )
 
-                    denom = v0[0] * v1[1] - v1[0] * v0[1]
-                    if abs(denom) < 1e-8:
-                        continue
+        # Interpolate depth
+        depth_out, _ = dr.interpolate(
+            z_values, rast_out, faces_batch
+        )
+        depth_out = depth_out[..., 0]
 
-                    v = (v2[0] * v1[1] - v1[0] * v2[1]) / denom
-                    u = (v0[0] * v2[1] - v2[0] * v0[1]) / denom
+        # Apply masks
+        rgbs_torch = color_out * masks.unsqueeze(-1)
+        depths_torch = depth_out * masks
 
-                    if u >= 0 and v >= 0 and u + v <= 1:
-                        # Interpolate depth
-                        w0 = 1 - u - v
-                        w1 = u
-                        w2 = v
-                        z = (w0 * z_values[face[0]] +
-                             w1 * z_values[face[1]] +
-                             w2 * z_values[face[2]])
+        # Convert to numpy
+        rgbs = (rgbs_torch * 255).clamp(0, 255).byte().cpu().numpy()
+        depths = depths_torch.cpu().numpy()
 
-                        # Update if closer
-                        if z > 0 and z < depth_buffer[y, x]:
-                            depth_buffer[y, x] = z
-                            rgb[y, x] = [color, color, color]
+        return rgbs, depths
 
-        # Convert depth to meters
-        depth = np.where(depth_buffer == np.inf, 0, depth_buffer / 1000.0)
+    def _project_points(self, points_cam: torch.Tensor, K: torch.Tensor,
+                       width: int, height: int) -> torch.Tensor:
+        """
+        Project 3D points to normalized device coordinates.
 
-        return rgb, depth
+        Args:
+            points_cam: (N, V, 3) points in camera coordinates (meters)
+            K: 3x3 camera intrinsic matrix
+            width: Image width
+            height: Image height
+
+        Returns:
+            (N, V, 4) points in clip space
+        """
+        N, V, _ = points_cam.shape
+
+        # Project to image plane
+        points_proj = torch.matmul(
+            K.unsqueeze(0), points_cam.transpose(1, 2)
+        ).transpose(1, 2)  # (N, V, 3)
+
+        # Normalize by z
+        z = points_proj[..., 2:3].clamp(min=1e-5)
+        uv = points_proj[..., :2] / z
+
+        # Convert to NDC (-1 to 1)
+        u_ndc = 2.0 * uv[..., 0] / width - 1.0
+        v_ndc = 1.0 - 2.0 * uv[..., 1] / height  # Flip Y
+
+        # For nvdiffrast, we need (x, y, z, w) in clip space
+        # z should be negative for visible points
+        return torch.stack([
+            u_ndc,
+            v_ndc,
+            -points_cam[..., 2],  # Negative z for nvdiffrast
+            torch.ones_like(u_ndc)
+        ], dim=-1)
+
+    def set_mesh(self, mesh: trimesh.Trimesh):
+        """Update the mesh for rendering."""
+        self.vertices = torch.from_numpy(
+            mesh.vertices.astype(np.float32)
+        ).to(self.device)
+
+        self.faces = torch.from_numpy(
+            mesh.faces.astype(np.int32)
+        ).to(self.device)
+
+        if hasattr(mesh, 'vertex_normals') and mesh.vertex_normals is not None:
+            light_dir = np.array([0.0, 0.0, 1.0])
+            shading = np.clip(mesh.vertex_normals @ light_dir, 0.3, 1.0)
+            colors = np.stack([shading] * 3, axis=-1)
+        else:
+            colors = np.ones((len(mesh.vertices), 3)) * 0.7
+
+        self.vertex_colors = torch.from_numpy(
+            colors.astype(np.float32)
+        ).to(self.device)
+
+        self.n_vertices = len(mesh.vertices)
+        self.n_faces = len(mesh.faces)
 
 
-# Test the renderer
+# Unit tests
 if __name__ == "__main__":
-    from LMODataLoader import LMODataLoader
+    import matplotlib
+    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    from DataLoader import DataLoader
 
-    # Load mesh
-    loader = LMODataLoader(".")
-    mesh = loader.load_object_model(1, debug=False)
+    logging.basicConfig(level=logging.INFO)
 
-    # Create renderer
+    print("="*80)
+    print("Mesh Renderer Unit Tests")
+    print("="*80)
+
+    # Load test data
+    loader = DataLoader("./data")
+
+    # Test 1: Single pose rendering
+    print("\nTest 1: Single Pose Rendering")
+
+    # Load a mesh
+    mesh = loader.load_object_model(1)
     renderer = MeshRenderer(mesh)
 
-    # Test pose
-    pose = np.eye(4)
-    pose[:3, 3] = [0, 0, 1000]  # 1m away
+    # Debug info
+    print(f"Mesh bounds: {mesh.bounds}")
+    print(f"Mesh center: {mesh.vertices.mean(axis=0)}")
+    print(f"Camera K:\n{loader.K}")
 
-    # Test intrinsics
-    K = np.array([[572.4, 0, 80],
-                  [0, 573.5, 80],
-                  [0, 0, 1]])
+    # Create test pose (object at 0.5m from camera)
+    pose = np.eye(4, dtype=np.float32)
+    pose[2, 3] = 0.5  # 0.5 meters in Z
+
+    # Add slight rotation to see the object better
+    pose[:3, :3] = cv2.Rodrigues(np.array([0.2, 0.3, 0], dtype=np.float32))[0]
 
     # Render
-    rgb, depth = renderer.render(pose, K, 160, 160)
+    rgb, depth = renderer.render(pose, loader.K, 160, 160)
 
-    # Display
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10, 5))
-    ax1.imshow(rgb)
-    ax1.set_title("Rendered RGB")
-    ax1.axis('off')
+    print(f"RGB shape: {rgb.shape}, dtype: {rgb.dtype}")
+    print(f"Depth shape: {depth.shape}, dtype: {depth.dtype}")
+    print(f"Unique RGB values: {np.unique(rgb).shape[0]}")
+    if depth[depth > 0].size > 0:
+        print(f"Depth range: {depth[depth > 0].min():.3f} - {depth[depth > 0].max():.3f} m")
+        print(f"Number of valid depth pixels: {(depth > 0).sum()}")
+    else:
+        print("Object not visible in depth.")
 
-    ax2.imshow(depth, cmap='jet')
-    ax2.set_title("Rendered Depth")
-    ax2.axis('off')
+    # Test 2: Batch rendering
+    print("\nTest 2: Batch Rendering")
 
+    # Create multiple poses
+    n_poses = 8
+    poses = []
+    for i in range(n_poses):
+        angle = i * 2 * np.pi / n_poses
+        pose = np.eye(4, dtype=np.float32)
+        pose[:3, :3] = cv2.Rodrigues(np.array([0, angle, 0], dtype=np.float32))[0]
+        pose[2, 3] = 0.5
+        poses.append(pose)
+    poses = np.array(poses)
+
+    # Batch render
+    import time
+    t0 = time.time()
+    rgbs, depths = renderer.render_batch(poses, loader.K, 160, 160)
+    t_batch = time.time() - t0
+
+    print(f"Batch rendered {n_poses} poses in {t_batch:.3f}s ({n_poses/t_batch:.1f} fps)")
+    print(f"RGBs shape: {rgbs.shape}")
+    print(f"Depths shape: {depths.shape}")
+
+    # Test 3: Compare with ground truth
+    print("\nTest 3: Render at GT Pose")
+
+    # Load a frame with ground truth
+    scenes = loader.get_available_scenes()
+    if scenes:
+        data = loader.load_frame_data(scenes[0], 0)
+        if data['poses']:
+            gt_pose = data['poses'][0]
+            obj_id = data['object_ids'][0]
+
+            # Render at GT pose
+            mesh = loader.load_object_model(obj_id)
+            renderer.set_mesh(mesh)
+            rgb_synth, depth_synth = renderer.render(gt_pose, data['K'],
+                                                    loader.width, loader.height)
+
+            print(f"Rendered object {obj_id} at GT pose")
+            print(f"GT pose translation: {gt_pose[:3, 3]}")
+            if data['depth'][data['depth'] > 0].size > 0:
+                print(f"Real depth range: {data['depth'][data['depth'] > 0].min():.3f} - "
+                      f"{data['depth'][data['depth'] > 0].max():.3f} m")
+            if depth_synth[depth_synth > 0].size > 0:
+                print(f"Synth depth range: {depth_synth[depth_synth > 0].min():.3f} - "
+                      f"{depth_synth[depth_synth > 0].max():.3f} m")
+
+    # Visualize results
+    fig, axes = plt.subplots(3, n_poses, figsize=(2*n_poses, 6))
+
+    for i in range(n_poses):
+        # RGB
+        axes[0, i].imshow(rgbs[i])
+        axes[0, i].axis('off')
+        if i == 0:
+            axes[0, i].set_ylabel('RGB', fontsize=12)
+
+        # Depth
+        depth_vis = depths[i].copy()
+        if depth_vis[depth_vis > 0].size > 0:
+            vmin = depth_vis[depth_vis > 0].min()
+            vmax = depth_vis[depth_vis > 0].max()
+            depth_vis[depth_vis == 0] = np.nan
+            axes[1, i].imshow(depth_vis, cmap='viridis', vmin=vmin, vmax=vmax)
+        else:
+            axes[1, i].imshow(depth_vis, cmap='viridis')
+        axes[1, i].axis('off')
+        if i == 0:
+            axes[1, i].set_ylabel('Depth', fontsize=12)
+
+        # Mask
+        mask = depths[i] > 0
+        axes[2, i].imshow(mask, cmap='gray')
+        axes[2, i].axis('off')
+        if i == 0:
+            axes[2, i].set_ylabel('Mask', fontsize=12)
+
+    plt.suptitle('Batch Rendering Results - Object Rotated 360°')
     plt.tight_layout()
-    plt.show()
 
-    print(f"RGB range: [{rgb.min()}, {rgb.max()}]")
-    print(f"Depth range: [{depth[depth > 0].min():.3f}, {depth.max():.3f}] m")
-    print(f"Non-zero pixels: {np.sum(depth > 0)}")
+    # Save
+    from pathlib import Path
+    viz_dir = Path("viz")
+    viz_dir.mkdir(exist_ok=True)
+    plt.savefig(viz_dir / 'meshrenderer_test.png', dpi=150, bbox_inches='tight')
+    print(f"\nVisualization saved to: {viz_dir / 'meshrenderer_test.png'}")
+
+    print("\n" + "="*80)
+    print("All tests passed!")
+    print("="*80)

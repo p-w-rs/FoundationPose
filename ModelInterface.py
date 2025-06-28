@@ -3,113 +3,85 @@ import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
 from typing import Dict, List, Tuple, Optional
-import time
-from pathlib import Path
 import logging
+from pathlib import Path
 
-# Set up TensorRT logger
+# TensorRT logger
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
 
 class ModelInterface:
     """
-    TensorRT-optimized interface for FoundationPose ONNX models.
+    Pure TensorRT interface for FoundationPose models.
 
-    UNITS:
-    - Poses: millimeters (mm)
-    - Depth input: meters (converted from loader)
-    - Model processing: millimeters
-
-    Models expect 160x160 RGBD patches with 6 channels:
-    - Channels 0-2: RGB normalized to [0, 1]
-    - Channels 3-5: Depth (repeated 3x) normalized
-
-    Optimization details:
-    - FP16 precision for maximum throughput
-    - Dynamic batch sizes from 1 to MAX_BATCH_SIZE
-    - Optimized for RTX 2000 Ada (8GB VRAM)
+    Processes batches of N poses simultaneously:
+    - Input: (N, 160, 160, 6) real and rendered RGBDDD
+    - Output: N pose updates or N scores
     """
 
-    def __init__(self, model_dir: str = "models", max_batch_size: int = 32):
-        """
-        Initialize TensorRT interface.
-
-        Args:
-            model_dir: Directory containing ONNX models
-            max_batch_size: Maximum batch size for TensorRT optimization
-        """
+    def __init__(self, model_dir: str = "models", max_batch_size: int = 252,
+                 opt_batch_size: int = 64, use_fp16: bool = True):
         self.model_dir = Path(model_dir)
         self.max_batch_size = max_batch_size
-        self.input_size = 160
+        self.opt_batch_size = opt_batch_size
+        self.use_fp16 = use_fp16
+        self.logger = logging.getLogger(__name__)
 
-        # TensorRT engines and contexts
+        # TensorRT engines
         self.refiner_engine = None
-        self.refiner_context = None
         self.scorer_engine = None
+
+        # Execution contexts
+        self.refiner_context = None
         self.scorer_context = None
 
-        # CUDA stream for async operations
+        # CUDA stream
         self.stream = cuda.Stream()
 
-        # Allocate device memory (will be set after loading)
+        # Allocated buffers
         self.refiner_buffers = {}
         self.scorer_buffers = {}
 
     def load_models(self):
-        """Load and optimize both refiner and scorer models with TensorRT."""
-        print(f"Loading TensorRT models with FP16 optimization...")
-        print(f"Maximum batch size: {self.max_batch_size}")
+        """Load and build TensorRT engines from ONNX models."""
+        trt_cache_dir = self.model_dir / 'trt_cache'
+        trt_cache_dir.mkdir(exist_ok=True)
 
         # Load refiner
-        refiner_path = self.model_dir / "refine_model.onnx"
-        refiner_engine_path = self.model_dir / f"refine_model_fp16_b{self.max_batch_size}.engine"
+        refiner_onnx = self.model_dir / "refine_model.onnx"
+        refiner_engine_path = trt_cache_dir / f"refine_fp16_{self.max_batch_size}.engine"
 
-        if not refiner_path.exists():
-            raise FileNotFoundError(f"Refiner ONNX not found: {refiner_path}")
-
+        self.logger.info("Loading refiner model...")
         self.refiner_engine = self._build_or_load_engine(
-            refiner_path, refiner_engine_path, "refiner"
+            refiner_onnx, refiner_engine_path, "refiner"
         )
         self.refiner_context = self.refiner_engine.create_execution_context()
         self._allocate_buffers(self.refiner_engine, self.refiner_buffers)
 
         # Load scorer
-        scorer_path = self.model_dir / "score_model.onnx"
-        scorer_engine_path = self.model_dir / f"score_model_fp16_b{self.max_batch_size}.engine"
+        scorer_onnx = self.model_dir / "score_model.onnx"
+        scorer_engine_path = trt_cache_dir / f"score_fp16_{self.max_batch_size}.engine"
 
-        if not scorer_path.exists():
-            raise FileNotFoundError(f"Scorer ONNX not found: {scorer_path}")
-
+        self.logger.info("Loading scorer model...")
         self.scorer_engine = self._build_or_load_engine(
-            scorer_path, scorer_engine_path, "scorer"
+            scorer_onnx, scorer_engine_path, "scorer"
         )
         self.scorer_context = self.scorer_engine.create_execution_context()
         self._allocate_buffers(self.scorer_engine, self.scorer_buffers)
 
-        print("TensorRT models loaded successfully!")
-        self._print_engine_info()
+        self.logger.info("Models loaded successfully")
 
     def _build_or_load_engine(self, onnx_path: Path, engine_path: Path,
-                             model_name: str) -> trt.ICudaEngine:
-        """
-        Build TensorRT engine from ONNX or load cached engine.
-
-        Args:
-            onnx_path: Path to ONNX model
-            engine_path: Path to save/load TensorRT engine
-            model_name: Name for logging
-
-        Returns:
-            TensorRT engine optimized for FP16
-        """
-        # Try to load existing engine
+                              model_name: str) -> trt.ICudaEngine:
+        """Build TensorRT engine from ONNX or load cached engine."""
+        # Try loading cached engine
         if engine_path.exists():
-            print(f"Loading cached {model_name} engine from {engine_path}")
+            self.logger.info(f"Loading cached {model_name} engine from {engine_path}")
             with open(engine_path, 'rb') as f:
                 runtime = trt.Runtime(TRT_LOGGER)
                 return runtime.deserialize_cuda_engine(f.read())
 
         # Build new engine
-        print(f"Building {model_name} TensorRT engine with FP16 optimization...")
+        self.logger.info(f"Building {model_name} engine from {onnx_path}")
         builder = trt.Builder(TRT_LOGGER)
         network = builder.create_network(
             1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
@@ -120,608 +92,340 @@ class ModelInterface:
         with open(onnx_path, 'rb') as f:
             if not parser.parse(f.read()):
                 for error in range(parser.num_errors):
-                    print(parser.get_error(error))
-                raise RuntimeError(f"Failed to parse {model_name} ONNX")
+                    self.logger.error(parser.get_error(error))
+                raise RuntimeError(f"Failed to parse {onnx_path}")
 
         # Configure builder
         config = builder.create_builder_config()
-        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 1 << 30)  # 1GB workspace
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 8 << 30) # 8GB
 
-        # Enable FP16
-        config.set_flag(trt.BuilderFlag.FP16)
+        if self.use_fp16:
+            config.set_flag(trt.BuilderFlag.FP16)
 
-        # Set dynamic shapes optimization profile
+        # Set optimization profiles for dynamic batch
         profile = builder.create_optimization_profile()
         for i in range(network.num_inputs):
             input_tensor = network.get_input(i)
-            # Min, optimal, max batch sizes
-            profile.set_shape(
-                input_tensor.name,
-                (1, 160, 160, 6),      # min
-                (32, 160, 160, 6),     # optimal
-                (self.max_batch_size, 160, 160, 6)  # max
-            )
+            # Define shape for dynamic inputs. Non-input tensors (outputs) will adapt.
+            min_shape = list(input_tensor.shape)
+            opt_shape = list(input_tensor.shape)
+            max_shape = list(input_tensor.shape)
+
+            # NOTE: Assuming the dynamic dimension is the first one (batch size)
+            min_shape[0] = 1
+            opt_shape[0] = self.opt_batch_size
+            max_shape[0] = self.max_batch_size
+
+            profile.set_shape(input_tensor.name, min_shape, opt_shape, max_shape)
         config.add_optimization_profile(profile)
 
         # Build engine
-        engine = builder.build_serialized_network(network, config)
-        if engine is None:
+        # In TensoRT 8.6+, build_serialized_network is deprecated
+        # Using get_memory_size and build_engine for newer versions might be better
+        serialized_engine = builder.build_serialized_network(network, config)
+        if serialized_engine is None:
             raise RuntimeError(f"Failed to build {model_name} engine")
 
         # Save engine
-        print(f"Saving {model_name} engine to {engine_path}")
         with open(engine_path, 'wb') as f:
-            f.write(engine)
+            f.write(serialized_engine)
 
         runtime = trt.Runtime(TRT_LOGGER)
-        return runtime.deserialize_cuda_engine(engine)
+        return runtime.deserialize_cuda_engine(serialized_engine)
 
     def _allocate_buffers(self, engine: trt.ICudaEngine, buffers: Dict):
-        """
-        Allocate CUDA memory for engine inputs/outputs.
-
-        Args:
-            engine: TensorRT engine
-            buffers: Dictionary to store allocated buffers
-        """
-        # First, calculate total memory needed
-        total_host_mem = 0
-        allocations = []
-
+        """Allocate CUDA memory for inputs/outputs."""
         for i in range(engine.num_io_tensors):
             name = engine.get_tensor_name(i)
-            shape = engine.get_tensor_shape(name)
             dtype = trt.nptype(engine.get_tensor_dtype(name))
+            shape = list(engine.get_tensor_shape(name))
+            is_input = engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
 
-            shape_with_batch = list(shape)
-            if shape_with_batch[0] == -1:  # Dynamic batch dimension
-                shape_with_batch[0] = self.max_batch_size
+            # FIX: Handle dynamic dimensions (-1) in any position of the shape.
+            # The original code only checked shape[0], causing an error if the
+            # shape was, for example, [1, -1] for the scorer output.
+            for i, dim in enumerate(shape):
+                if dim == -1:
+                    shape[i] = self.max_batch_size
 
-            # Check for any remaining negative dimensions
-            for j, dim in enumerate(shape_with_batch):
-                if dim < 0:
-                    # Default size for unknown dimensions
-                    shape_with_batch[j] = 1
+            # Use np.int64 to prevent overflow on large models/batch sizes before converting to Python int
+            size = int(np.prod(shape, dtype=np.int64) * np.dtype(dtype).itemsize)
+            if size < 0:
+                raise ValueError(f"Buffer size calculation resulted in a negative value: {size}")
 
-            bytes_needed = np.prod(shape_with_batch) * np.dtype(dtype).itemsize
-            total_host_mem += bytes_needed
+            device_mem = cuda.mem_alloc(size)
 
-            allocations.append({
-                'name': name,
-                'shape': shape_with_batch,
-                'dtype': dtype,
-                'bytes': bytes_needed,
-                'is_input': engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
-            })
-
-        print(f"  Total memory required: {total_host_mem / 1024**2:.1f} MB")
-
-        # Now allocate
-        for alloc in allocations:
-            try:
-                # Try pinned memory first
-                host_mem = cuda.pagelocked_empty(alloc['shape'], alloc['dtype'])
-            except cuda.MemoryError:
-                print(f"  Warning: Could not allocate pinned memory for {alloc['name']}, using regular memory")
-                # Fall back to regular numpy array
-                host_mem = np.empty(alloc['shape'], dtype=alloc['dtype'])
-
-            device_mem = cuda.mem_alloc(int(alloc['bytes']))
-
-            buffers[alloc['name']] = {
-                'host': host_mem,
+            buffers[name] = {
                 'device': device_mem,
-                'shape': alloc['shape'],  # Use shape_with_batch, not original shape
-                'dtype': alloc['dtype'],
-                'is_input': alloc['is_input']
+                'host': cuda.pagelocked_empty(shape, dtype),
+                'shape': shape,
+                'dtype': dtype,
+                'is_input': is_input
             }
 
-    def _print_engine_info(self):
-        """Print TensorRT engine details."""
-        print("\nRefiner engine:")
-        for i in range(self.refiner_engine.num_io_tensors):
-            name = self.refiner_engine.get_tensor_name(i)
-            shape = self.refiner_engine.get_tensor_shape(name)
-            dtype = self.refiner_engine.get_tensor_dtype(name)
-            io_type = "Input" if self.refiner_engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT else "Output"
-            print(f"  {io_type}: {name} - {shape} ({dtype})")
+            self.logger.info(f"Allocated {name}: shape={shape}, dtype={dtype}, input={is_input}")
 
-        print("\nScorer engine:")
-        for i in range(self.scorer_engine.num_io_tensors):
-            name = self.scorer_engine.get_tensor_name(i)
-            shape = self.scorer_engine.get_tensor_shape(name)
-            dtype = self.scorer_engine.get_tensor_dtype(name)
-            io_type = "Input" if self.scorer_engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT else "Output"
-            print(f"  {io_type}: {name} - {shape} ({dtype})")
 
-    def prepare_input(self, real_rgb: np.ndarray, real_depth: np.ndarray,
-                     rendered_rgb: np.ndarray, rendered_depth: np.ndarray,
-                     K_crop: np.ndarray) -> Dict[str, np.ndarray]:
+    def refine_poses_batch(self, poses: np.ndarray, real_rgbddd: np.ndarray,
+                           rendered_rgbddd: np.ndarray, iterations: int = 5) -> np.ndarray:
         """
-        Prepare inputs for models - optimized for batch processing.
-
-        Input specifications:
-        - Real/rendered RGB: (160, 160, 3) uint8 [0-255]
-        - Real/rendered depth: (160, 160) float32 in meters
-        - K_crop: (3, 3) camera intrinsics (unused in model)
-
-        Output format:
-        - input1: (1, 160, 160, 6) - real RGB + depth
-        - input2: (1, 160, 160, 6) - rendered RGB + depth
-
-        Channels are organized as [R, G, B, D, D, D] normalized to ~[0, 1]
-        """
-        # Debug print shapes
-        if len(real_rgb.shape) != 3 or real_rgb.shape[2] != 3:
-            raise ValueError(f"Expected real_rgb shape (160, 160, 3), got {real_rgb.shape}")
-        if len(real_depth.shape) not in [2, 3]:
-            raise ValueError(f"Expected real_depth shape (160, 160) or (160, 160, 1), got {real_depth.shape}")
-
-        # Convert depth to millimeters for better numerical range
-        real_depth_mm = real_depth * 1000.0
-        rendered_depth_mm = rendered_depth * 1000.0
-
-        # Normalize RGB to [0, 1]
-        real_rgb_norm = real_rgb.astype(np.float32) / 255.0
-        rendered_rgb_norm = rendered_rgb.astype(np.float32) / 255.0
-
-        # Normalize depth (divide by 1000 to get ~1.0 range)
-        real_depth_norm = real_depth_mm / 1000.0
-        rendered_depth_norm = rendered_depth_mm / 1000.0
-
-        # Handle 2D depth arrays
-        if len(real_depth_norm.shape) == 3:
-            real_depth_norm = real_depth_norm[..., 0]
-        if len(rendered_depth_norm.shape) == 3:
-            rendered_depth_norm = rendered_depth_norm[..., 0]
-
-        # Expand depth to 3 channels
-        real_depth_expanded = np.repeat(real_depth_norm[..., np.newaxis], 3, axis=-1)
-        rendered_depth_expanded = np.repeat(rendered_depth_norm[..., np.newaxis], 3, axis=-1)
-
-        # Stack RGBD (6 channels)
-        input1 = np.concatenate([real_rgb_norm, real_depth_expanded], axis=-1)
-        input2 = np.concatenate([rendered_rgb_norm, rendered_depth_expanded], axis=-1)
-
-        # Add batch dimension
-        input1 = input1[np.newaxis, ...].astype(np.float32)
-        input2 = input2[np.newaxis, ...].astype(np.float32)
-
-        return {'input1': input1, 'input2': input2}
-
-    def _execute_engine(self, context: trt.IExecutionContext,
-                       buffers: Dict, inputs: Dict[str, np.ndarray],
-                       batch_size: int) -> List[np.ndarray]:
-        """
-        Execute TensorRT engine with given inputs.
+        Refine N poses in batch.
 
         Args:
-            context: TensorRT execution context
-            buffers: Pre-allocated CUDA buffers
-            inputs: Input data dictionary
-            batch_size: Current batch size
+            poses: (N, 4, 4) pose matrices
+            real_rgbddd: (N, 160, 160, 6) real observation (can be single repeated)
+            rendered_rgbddd: (N, 160, 160, 6) rendered views
+            iterations: Number of refinement iterations
 
         Returns:
-            List of output arrays
+            (N, 4, 4) refined poses
         """
-        # Set batch size for dynamic shapes
-        context.set_input_shape('input1', (batch_size, 160, 160, 6))
-        context.set_input_shape('input2', (batch_size, 160, 160, 6))
-
-        # Copy inputs to device
-        for name, data in inputs.items():
-            if name in buffers:
-                # Copy only the valid batch size portion
-                buffers[name]['host'][:batch_size] = data
-                cuda.memcpy_htod_async(
-                    buffers[name]['device'],
-                    buffers[name]['host'][:batch_size],
-                    self.stream
-                )
-                # Set tensor address
-                context.set_tensor_address(name, int(buffers[name]['device']))
-
-        # Set output tensor addresses
-        for name, buf in buffers.items():
-            if not buf['is_input']:
-                context.set_tensor_address(name, int(buf['device']))
-
-        # Execute
-        context.execute_async_v3(stream_handle=self.stream.handle)
-
-        # Copy outputs back
-        for name, buf in buffers.items():
-            if not buf['is_input']:
-                cuda.memcpy_dtoh_async(buf['host'], buf['device'], self.stream)
-
-        # Synchronize
-        self.stream.synchronize()
-
-        # Extract outputs
-        outputs = []
-        is_scorer = len([b for b in buffers.values() if not b['is_input']]) == 1
-
-        for name, buf in buffers.items():
-            if not buf['is_input']:
-                if is_scorer:
-                    # Scorer has output shape (1, batch_size)
-                    # The data is stored as a flat array
-                    output_data = buf['host'].flatten()[:batch_size]
-                    outputs.append(output_data)  # Return as 1D array for scorer
-                else:
-                    # Refiner has outputs shape (batch_size, 3)
-                    output_data = buf['host'].reshape(-1)[:batch_size * 3].reshape(batch_size, 3)
-                    outputs.append(output_data)
-
-        return outputs
-
-    def refine_pose(self, pose: np.ndarray, real_rgb: np.ndarray,
-                   real_depth: np.ndarray, K_crop: np.ndarray,
-                   mesh_renderer, iterations: int = 5) -> np.ndarray:
-        """
-        Iteratively refine a single pose using TensorRT.
-
-        Maintains original API for compatibility.
-        """
-        if self.refiner_context is None:
-            raise RuntimeError("Models not loaded")
-
-        current_pose = pose.copy()
-
-        for i in range(iterations):
-            # Render at current pose
-            rendered_rgb, rendered_depth = mesh_renderer.render(
-                current_pose, K_crop, self.input_size, self.input_size
-            )
-
-            # Prepare inputs
-            inputs = self.prepare_input(
-                real_rgb, real_depth, rendered_rgb, rendered_depth, K_crop
-            )
-
-            # Execute refiner
-            outputs = self._execute_engine(
-                self.refiner_context, self.refiner_buffers, inputs, batch_size=1
-            )
-
-            # Extract pose updates
-            rotation_delta = outputs[0][0]      # (3,)
-            translation_delta = outputs[1][0]   # (3,)
-
-            # Update pose
-            current_pose = self._update_pose(current_pose, rotation_delta, translation_delta)
-
-        return current_pose
-
-    def score_poses(self, poses: List[np.ndarray], real_rgb: np.ndarray,
-                   real_depth: np.ndarray, K_crop: np.ndarray,
-                   mesh_renderer) -> np.ndarray:
-        """Score multiple poses - uses batching for efficiency."""
-        return self.score_poses_batch(
-            np.array(poses), real_rgb, real_depth, K_crop, mesh_renderer
-        )
-
-    def refine_poses_batch(self, poses: np.ndarray, real_rgb: np.ndarray,
-                          real_depth: np.ndarray, K_crop: np.ndarray,
-                          mesh_renderer, iterations: int = 5,
-                          gt_pose: np.ndarray = None, verbose: bool = True) -> np.ndarray:
-        """
-        Refine multiple poses in batch using TensorRT.
-
-        Optimized for throughput with batch processing.
-        """
-        if self.refiner_context is None:
-            raise RuntimeError("Models not loaded")
-
-        batch_size = len(poses)
+        n_poses = len(poses)
         current_poses = poses.copy()
 
+        # Ensure real observation is batched if a single one is provided
+        if real_rgbddd.ndim == 3:
+            real_rgbddd = np.repeat(real_rgbddd[np.newaxis], n_poses, axis=0)
+
         for iteration in range(iterations):
-            t_iter_start = time.time()
+            # Process all poses in chunks that fit max_batch_size
+            for start_idx in range(0, n_poses, self.max_batch_size):
+                end_idx = min(start_idx + self.max_batch_size, n_poses)
+                chunk_size = end_idx - start_idx
 
-            # Process in chunks if batch exceeds max
-            if batch_size > self.max_batch_size:
-                # Process in chunks
-                for start_idx in range(0, batch_size, self.max_batch_size):
-                    end_idx = min(start_idx + self.max_batch_size, batch_size)
-                    chunk_poses = current_poses[start_idx:end_idx]
+                # Get batch slice
+                real_batch = real_rgbddd[start_idx:end_idx].astype(np.float32)
+                rendered_batch = rendered_rgbddd[start_idx:end_idx].astype(np.float32)
 
-                    # Process chunk
-                    refined_chunk = self._refine_batch_chunk(
-                        chunk_poses, real_rgb, real_depth, K_crop, mesh_renderer
-                    )
-                    current_poses[start_idx:end_idx] = refined_chunk
-            else:
-                # Process all at once
-                current_poses = self._refine_batch_chunk(
-                    current_poses, real_rgb, real_depth, K_crop, mesh_renderer
+                # Set dynamic shapes for the current chunk
+                self.refiner_context.set_input_shape('input1', (chunk_size, 160, 160, 6))
+                self.refiner_context.set_input_shape('input2', (chunk_size, 160, 160, 6))
+
+                # Copy to GPU
+                cuda.memcpy_htod_async(
+                    self.refiner_buffers['input1']['device'],
+                    real_batch, self.stream
+                )
+                cuda.memcpy_htod_async(
+                    self.refiner_buffers['input2']['device'],
+                    rendered_batch, self.stream
                 )
 
-            t_iter = time.time() - t_iter_start
+                # Set tensor addresses for execution
+                for name, buf in self.refiner_buffers.items():
+                    self.refiner_context.set_tensor_address(name, int(buf['device']))
 
-            if verbose:
-                if gt_pose is not None:
-                    errors = [np.linalg.norm(pose[:3, 3] - gt_pose[:3, 3])
-                             for pose in current_poses]
-                    best_error = min(errors)
-                    avg_error = np.mean(errors)
-                    print(f"  Iteration {iteration+1}/{iterations}: "
-                          f"time={t_iter:.3f}s, best_error={best_error:.1f}mm, "
-                          f"avg_error={avg_error:.1f}mm")
-                else:
-                    print(f"  Iteration {iteration+1}/{iterations}: time={t_iter:.3f}s")
+                # Execute
+                self.refiner_context.execute_async_v3(stream_handle=self.stream.handle)
+
+                # Prepare host arrays for output
+                rotation_output = np.empty((chunk_size, 3), dtype=np.float32)
+                translation_output = np.empty((chunk_size, 3), dtype=np.float32)
+
+                # Copy outputs from GPU
+                cuda.memcpy_dtoh_async(
+                    rotation_output,
+                    self.refiner_buffers['output1']['device'],
+                    self.stream
+                )
+                cuda.memcpy_dtoh_async(
+                    translation_output,
+                    self.refiner_buffers['output2']['device'],
+                    self.stream
+                )
+
+                self.stream.synchronize()
+
+                # Apply deltas to poses
+                for i in range(chunk_size):
+                    idx = start_idx + i
+                    current_poses[idx] = self._apply_pose_delta(
+                        current_poses[idx], rotation_output[i], translation_output[i]
+                    )
+
+            # In a real pipeline, the newly refined poses would be used to
+            # re-render the `rendered_rgbddd` inputs for the next iteration.
 
         return current_poses
 
-    def _refine_batch_chunk(self, poses: np.ndarray, real_rgb: np.ndarray,
-                           real_depth: np.ndarray, K_crop: np.ndarray,
-                           mesh_renderer) -> np.ndarray:
-        """Process a single batch chunk through refiner."""
-        batch_size = len(poses)
-
-        # Prepare batch inputs
-        input1_batch = []
-        input2_batch = []
-
-        for i in range(batch_size):
-            # Render at current pose
-            rendered_rgb, rendered_depth = mesh_renderer.render(
-                poses[i], K_crop, self.input_size, self.input_size
-            )
-
-            # Prepare inputs
-            inputs = self.prepare_input(
-                real_rgb, real_depth, rendered_rgb, rendered_depth, K_crop
-            )
-            input1_batch.append(inputs['input1'][0])
-            input2_batch.append(inputs['input2'][0])
-
-        # Stack batch
-        input1_batch = np.stack(input1_batch)
-        input2_batch = np.stack(input2_batch)
-
-        # Execute refiner
-        outputs = self._execute_engine(
-            self.refiner_context, self.refiner_buffers,
-            {'input1': input1_batch, 'input2': input2_batch},
-            batch_size=batch_size
-        )
-
-        rotation_deltas = outputs[0]    # (N, 3)
-        translation_deltas = outputs[1] # (N, 3)
-
-        # Update all poses
-        updated_poses = poses.copy()
-        for i in range(batch_size):
-            updated_poses[i] = self._update_pose(
-                poses[i], rotation_deltas[i], translation_deltas[i]
-            )
-
-        return updated_poses
-
-    def score_poses_batch(self, poses: np.ndarray, real_rgb: np.ndarray,
-                         real_depth: np.ndarray, K_crop: np.ndarray,
-                         mesh_renderer) -> np.ndarray:
+    def score_poses_batch(self, real_rgbddd: np.ndarray,
+                          rendered_rgbddd: np.ndarray) -> np.ndarray:
         """
-        Score multiple poses in batch using TensorRT.
-
-        Optimized for high throughput scoring.
-        """
-        if self.scorer_context is None:
-            raise RuntimeError("Models not loaded")
-
-        batch_size = len(poses)
-        all_scores = []
-
-        # Process in chunks if needed
-        for start_idx in range(0, batch_size, self.max_batch_size):
-            end_idx = min(start_idx + self.max_batch_size, batch_size)
-            chunk_poses = poses[start_idx:end_idx]
-            chunk_size = len(chunk_poses)
-
-            # Prepare batch inputs
-            input1_batch = []
-            input2_batch = []
-
-            for i in range(chunk_size):
-                rendered_rgb, rendered_depth = mesh_renderer.render(
-                    chunk_poses[i], K_crop, self.input_size, self.input_size
-                )
-
-                inputs = self.prepare_input(
-                    real_rgb, real_depth, rendered_rgb, rendered_depth, K_crop
-                )
-                input1_batch.append(inputs['input1'][0])
-                input2_batch.append(inputs['input2'][0])
-
-            # Stack batch
-            input1_batch = np.stack(input1_batch)
-            input2_batch = np.stack(input2_batch)
-
-            # Execute scorer
-            outputs = self._execute_engine(
-                self.scorer_context, self.scorer_buffers,
-                {'input1': input1_batch, 'input2': input2_batch},
-                batch_size=chunk_size
-            )
-
-            # Extract scores
-            scores = outputs[0]  # Shape: (batch_size,) already flattened
-            all_scores.extend(scores[:chunk_size])
-
-        return np.array(all_scores)
-
-    def _update_pose(self, pose: np.ndarray, rotation_delta: np.ndarray,
-                    translation_delta: np.ndarray) -> np.ndarray:
-        """
-        Update pose with model-predicted deltas.
+        Score N poses in batch.
 
         Args:
-            pose: Current 4x4 pose matrix (mm)
-            rotation_delta: Rotation update (3,) - axis-angle representation
-            translation_delta: Translation update (3,) - millimeters
+            real_rgbddd: (N, 160, 160, 6) real observation
+            rendered_rgbddd: (N, 160, 160, 6) rendered views
 
         Returns:
-            Updated 4x4 pose matrix
+            (N,) scores
         """
-        updated_pose = pose.copy()
+        n_poses = len(rendered_rgbddd)
+        all_scores = np.empty(n_poses, dtype=np.float32)
 
-        # Apply translation update (mm)
-        updated_pose[:3, 3] += translation_delta
+        # Ensure real observation is batched if a single one is provided
+        if real_rgbddd.ndim == 3:
+            real_rgbddd = np.repeat(real_rgbddd[np.newaxis], n_poses, axis=0)
 
-        # Apply rotation update (axis-angle to rotation matrix)
+        for start_idx in range(0, n_poses, self.max_batch_size):
+            end_idx = min(start_idx + self.max_batch_size, n_poses)
+            chunk_size = end_idx - start_idx
+
+            # Get batch slice
+            real_batch = real_rgbddd[start_idx:end_idx].astype(np.float32)
+            rendered_batch = rendered_rgbddd[start_idx:end_idx].astype(np.float32)
+
+            # Set dynamic shapes
+            self.scorer_context.set_input_shape('input1', (chunk_size, 160, 160, 6))
+            self.scorer_context.set_input_shape('input2', (chunk_size, 160, 160, 6))
+
+            # Copy to GPU
+            cuda.memcpy_htod_async(
+                self.scorer_buffers['input1']['device'],
+                real_batch, self.stream
+            )
+            cuda.memcpy_htod_async(
+                self.scorer_buffers['input2']['device'],
+                rendered_batch, self.stream
+            )
+
+            # Set tensor addresses
+            for name, buf in self.scorer_buffers.items():
+                self.scorer_context.set_tensor_address(name, int(buf['device']))
+
+            # Execute
+            self.scorer_context.execute_async_v3(stream_handle=self.stream.handle)
+
+            # CHANGE: The host output buffer is now shaped (chunk_size,) to align
+            # with the docstring and simplify the logic. The original (1, chunk_size)
+            # was slightly awkward.
+            scores_output = np.empty(chunk_size, dtype=np.float32)
+
+            # Copy scores from GPU
+            cuda.memcpy_dtoh_async(
+                scores_output,
+                self.scorer_buffers['output1']['device'],
+                self.stream
+            )
+
+            self.stream.synchronize()
+            all_scores[start_idx:end_idx] = scores_output
+
+        return all_scores
+
+    def _apply_pose_delta(self, pose: np.ndarray, rotation_delta: np.ndarray,
+                          translation_delta: np.ndarray) -> np.ndarray:
+        """Apply pose update from refiner."""
+        # This import is here to avoid a hard dependency on OpenCV if only used here.
+        import cv2
+
         angle = np.linalg.norm(rotation_delta)
+        # Check for near-zero rotation to avoid division by zero
         if angle > 1e-6:
             axis = rotation_delta / angle
-            # Rodrigues' rotation formula
-            K = np.array([[0, -axis[2], axis[1]],
-                         [axis[2], 0, -axis[0]],
-                         [-axis[1], axis[0], 0]])
-            R_delta = np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * K @ K
-            updated_pose[:3, :3] = R_delta @ updated_pose[:3, :3]
+            # cv2.Rodrigues expects a (3, 1) or (1, 3) vector
+            R_delta, _ = cv2.Rodrigues(axis * angle)
+        else:
+            R_delta = np.eye(3)
+
+        updated_pose = pose.copy()
+        updated_pose[:3, :3] = R_delta @ pose[:3, :3]
+        updated_pose[:3, 3] += translation_delta
 
         return updated_pose
 
-    def __del__(self):
-        """Clean up CUDA resources."""
-        # Free allocated buffers
-        for buf in self.refiner_buffers.values():
-            if 'device' in buf:
-                buf['device'].free()
-        for buf in self.scorer_buffers.values():
-            if 'device' in buf:
-                buf['device'].free()
+    def warmup(self):
+        """Warmup engines to ensure optimal performance on first real inference."""
+        # Use a small, representative batch size for warmup
+        warmup_batch_size = self.opt_batch_size if self.opt_batch_size > 1 else 16
+        self.logger.info(f"Warming up with batch size {warmup_batch_size}...")
+
+        dummy_rgbddd = np.random.randn(warmup_batch_size, 160, 160, 6).astype(np.float32)
+        dummy_poses = np.tile(np.eye(4), (warmup_batch_size, 1, 1)).astype(np.float32)
+
+        for _ in range(3):
+            self.refine_poses_batch(dummy_poses, dummy_rgbddd, dummy_rgbddd, iterations=1)
+            self.score_poses_batch(dummy_rgbddd, dummy_rgbddd)
+
+        self.logger.info("Warmup complete")
+
+    # Legacy wrappers
+    def score_poses(self, poses: List[np.ndarray], real_rgbddd: np.ndarray,
+                    rendered_rgbddd_list: List[np.ndarray]) -> np.ndarray:
+        """Legacy interface for pipeline compatibility."""
+        rendered_batch = np.stack(rendered_rgbddd_list)
+        return self.score_poses_batch(real_rgbddd, rendered_batch)
+
+    def refine_pose(self, pose: np.ndarray, real_rgbddd: np.ndarray,
+                    rendered_rgbddd: np.ndarray, iterations: int = 5) -> np.ndarray:
+        """Legacy single pose interface."""
+        refined = self.refine_poses_batch(
+            np.array([pose]), real_rgbddd, np.array([rendered_rgbddd]), iterations
+        )
+        return refined[0]
 
 
-# Test the implementation
+# Unit tests
 if __name__ == "__main__":
-    import logging
-    logging.basicConfig(level=logging.INFO)
-
-    class MockMeshRenderer:
-        """Mock renderer for testing."""
-        def render(self, pose, K, h, w):
-            # Return dummy rendered data
-            rgb = np.random.randint(0, 255, (h, w, 3), dtype=np.uint8)
-            depth = np.random.uniform(0.3, 2.0, (h, w)).astype(np.float32)
-            return rgb, depth
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
     print("="*80)
-    print("FoundationPose TensorRT Unit Tests")
+    print("TensorRT Batch Performance Tests")
     print("="*80)
 
-    interface = ModelInterface()
+    # Initialize
+    interface = ModelInterface(max_batch_size=252, opt_batch_size=64, use_fp16=True)
+
+    # Load models
+    print("\nLoading models...")
     interface.load_models()
 
+    # Warmup
+    print("\nWarming up...")
+    interface.warmup()
+
+    # Performance test
+    print("\nBatch Performance Tests:")
+    print("-"*60)
+    import time
+
     # Test data
-    dummy_rgb = np.random.randint(0, 255, (160, 160, 3), dtype=np.uint8)
-    dummy_depth = np.random.uniform(0.3, 2.0, (160, 160)).astype(np.float32)
-    dummy_K = np.array([[500, 0, 80], [0, 500, 80], [0, 0, 1]], dtype=np.float32)
-    dummy_pose = np.eye(4, dtype=np.float32)
-    dummy_pose[:3, 3] = [100, 200, 500]  # mm
+    dummy_rgbddd = np.random.randn(160, 160, 6).astype(np.float32)
+    dummy_rgbddd[:, :, :3] = np.clip(dummy_rgbddd[:, :, :3], 0, 1)
 
-    renderer = MockMeshRenderer()
+    # Test different batch sizes
+    for n_poses in [64, 128, 252]:
+        print(f"\nBatch size: {n_poses} poses")
 
-    print("\n" + "="*80)
-    print("Test 1: Input Preparation")
-    print("="*80)
-    inputs = interface.prepare_input(
-        dummy_rgb, dummy_depth, dummy_rgb, dummy_depth, dummy_K
-    )
-    print(f"✓ Input preparation successful")
-    for k, v in inputs.items():
-        print(f"  {k}: shape={v.shape}, dtype={v.dtype}, range=[{v.min():.3f}, {v.max():.3f}]")
+        # Create batch data
+        poses_batch = np.tile(np.eye(4), (n_poses, 1, 1)).astype(np.float32)
+        # The real observation is typically the same for all poses in a hypothesis batch
+        real_batch = np.repeat(dummy_rgbddd[np.newaxis], n_poses, axis=0)
+        rendered_batch = np.repeat(dummy_rgbddd[np.newaxis], n_poses, axis=0)
 
-    print("\n" + "="*80)
-    print("Test 2: Single Pose Refinement")
-    print("="*80)
-    t_start = time.time()
-    refined_pose = interface.refine_pose(
-        dummy_pose, dummy_rgb, dummy_depth, dummy_K, renderer, iterations=3
-    )
-    t_refine = time.time() - t_start
-    print(f"✓ Single pose refined in {t_refine:.3f}s ({t_refine/3:.3f}s per iteration)")
-    print(f"  Original translation: {dummy_pose[:3, 3]}")
-    print(f"  Refined translation: {refined_pose[:3, 3]}")
+        # --- Test refinement (5 iterations) ---
+        t0 = time.time()
+        refined = interface.refine_poses_batch(poses_batch, real_batch, rendered_batch, iterations=5)
+        t_refine = time.time() - t0
 
-    print("\n" + "="*80)
-    print("Test 3: Pose Scoring")
-    print("="*80)
-    test_poses = [dummy_pose + np.random.randn(4, 4) * 0.1 for _ in range(10)]
-    t_start = time.time()
-    scores = interface.score_poses(test_poses, dummy_rgb, dummy_depth, dummy_K, renderer)
-    t_score = time.time() - t_start
-    print(f"✓ Scored {len(test_poses)} poses in {t_score:.3f}s ({t_score/len(test_poses)*1000:.1f}ms per pose)")
-    print(f"  Score range: [{scores.min():.3f}, {scores.max():.3f}]")
+        # --- Test scoring ---
+        t0 = time.time()
+        scores = interface.score_poses_batch(real_batch, rendered_batch)
+        t_score = time.time() - t0
+
+        # --- Report results ---
+        # Throughput in poses per second
+        refine_hz = n_poses / t_refine
+        score_hz = n_poses / t_score
+
+        print(f"  Refine (5 iter): {t_refine*1000:.1f} ms ({refine_hz:.1f} poses/sec)")
+        print(f"  Score:           {t_score*1000:.1f} ms ({score_hz:.1f} poses/sec)")
+        print(f"  Total pipeline:  {(t_refine + t_score)*1000:.1f} ms")
+
+        # Calculate throughput for a combined pipeline (one refine pass + one score pass)
+        pipeline_hz = n_poses / (t_refine/5 + t_score) # NOTE: normalize refine time to 1 iteration
+        print(f"  Pipeline throughput (1 iter refine + score): {pipeline_hz:.1f} poses/sec")
 
     print("\n" + "="*80)
-    print("Test 4: Batch Performance Benchmark")
-    print("="*80)
-    batch_sizes = [1, 8, 16, 32]
-    print(f"{'Batch Size':<12} {'Refine Time':<15} {'Poses/sec':<15} {'Score Time':<15} {'Scores/sec':<15}")
-    print("-" * 72)
-
-    for batch_size in batch_sizes:
-        # Generate batch poses
-        batch_poses = np.array([dummy_pose + np.random.randn(4, 4) * 0.1
-                               for _ in range(batch_size)])
-
-        # Test batch refinement
-        t_start = time.time()
-        refined_batch = interface.refine_poses_batch(
-            batch_poses, dummy_rgb, dummy_depth, dummy_K, renderer,
-            iterations=1, verbose=False
-        )
-        t_refine = time.time() - t_start
-        refine_fps = batch_size / t_refine
-
-        # Test batch scoring
-        t_start = time.time()
-        scores = interface.score_poses_batch(
-            batch_poses, dummy_rgb, dummy_depth, dummy_K, renderer
-        )
-        t_score = time.time() - t_start
-        score_fps = batch_size / t_score
-
-        print(f"{batch_size:<12} {t_refine:<15.3f} {refine_fps:<15.1f} {t_score:<15.3f} {score_fps:<15.1f}")
-
-    print("\n" + "="*80)
-    print("Test 5: Memory Usage")
-    print("="*80)
-    total_gpu_mem = 0
-    for name, buf in {**interface.refiner_buffers, **interface.scorer_buffers}.items():
-        mem_mb = buf['host'].nbytes / 1024**2
-        total_gpu_mem += mem_mb
-        print(f"  {name}: {mem_mb:.1f} MB")
-    print(f"Total GPU memory allocated: {total_gpu_mem:.1f} MB")
-
-    print("\n" + "="*80)
-    print("Test 6: Edge Cases")
-    print("="*80)
-
-    # Test with zeros
-    zero_rgb = np.zeros((160, 160, 3), dtype=np.uint8)
-    zero_depth = np.zeros((160, 160), dtype=np.float32)
-    try:
-        inputs = interface.prepare_input(zero_rgb, zero_depth, zero_rgb, zero_depth, dummy_K)
-        print("✓ Handled zero inputs successfully")
-    except Exception as e:
-        print(f"✗ Failed on zero inputs: {e}")
-
-    # Test with very small batch
-    single_pose = np.array([dummy_pose])
-    try:
-        score = interface.score_poses_batch(single_pose, dummy_rgb, dummy_depth, dummy_K, renderer)
-        print(f"✓ Handled single pose batch: score={score[0]:.3f}")
-    except Exception as e:
-        print(f"✗ Failed on single pose batch: {e}")
-
-    print("\n" + "="*80)
-    print("Summary")
-    print("="*80)
-    print("✓ TensorRT FP16 optimization enabled")
-    print(f"✓ Maximum batch size: {interface.max_batch_size}")
-    print("✓ All tests passed")
-    print(f"✓ Peak throughput: ~{max(score_fps for batch_size in batch_sizes):.0f} poses/sec")
-    print("✓ Ready for production use")
+    print("Tests complete!")
     print("="*80)

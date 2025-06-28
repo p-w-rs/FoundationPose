@@ -1,360 +1,300 @@
 import numpy as np
-import cv2
-import matplotlib.pyplot as plt
-from typing import Tuple, Optional, Dict
-import trimesh
-from LMODataLoader import LMODataLoader
+from typing import Tuple, Optional
+import logging
 
 class DepthProcessor:
     """
-    Handles depth processing and coordinate transformations for FoundationPose.
+    Convert RGB and depth images to RGBDDD format for FoundationPose models.
 
-    Key operations:
-    1. Depth map to 3D point cloud conversion
-    2. Coordinate frame transformations
-    3. Point cloud cropping and normalization
-    4. Preparation for model input (160x160 patches)
+    Takes 160x160 RGB/depth from either:
+    - Synthetic: PoseGenerator + MeshRenderer
+    - Real: CropProcessor
+
+    Outputs 6-channel RGBDDD:
+    - Channels 0-2: RGB normalized to [0, 1]
+    - Channels 3-5: XYZ point cloud in meters
+
+    UNITS:
+    - Input depth: meters (m)
+    - Output XYZ: meters (m)
+    - Camera intrinsics: pixels
     """
 
-    def __init__(self, camera_K: np.ndarray):
-        """
-        Args:
-            camera_K: 3x3 camera intrinsic matrix
-        """
-        self.K = camera_K
-        self.fx = camera_K[0, 0]
-        self.fy = camera_K[1, 1]
-        self.cx = camera_K[0, 2]
-        self.cy = camera_K[1, 2]
+    def __init__(self):
+        """Initialize depth processor."""
+        self.logger = logging.getLogger(__name__)
 
-    def depth_to_pointcloud(self, depth: np.ndarray, mask: Optional[np.ndarray] = None,
-                           unit: str = 'mm') -> np.ndarray:
+    def depth_to_xyz(self, depth: np.ndarray, K: np.ndarray) -> np.ndarray:
         """
-        Convert depth map to 3D point cloud in camera coordinates.
+        Convert depth map to XYZ point cloud.
 
         Args:
-            depth: Depth map (H, W) - assumes input is in meters from our loader
-            mask: Optional binary mask to filter points (H, W)
-            unit: Output unit - 'mm' or 'm' (default 'mm' for FoundationPose)
+            depth: (H, W) depth map in meters
+            K: 3x3 camera intrinsic matrix
 
         Returns:
-            points: 3D points in camera frame (N, 3) in specified units
-
-        Camera coordinate system (OpenCV convention):
-        - X: right
-        - Y: down
-        - Z: forward (into the scene)
+            (H, W, 3) XYZ point cloud in meters
         """
-        H, W = depth.shape
+        h, w = depth.shape
 
         # Create pixel grid
-        u, v = np.meshgrid(np.arange(W), np.arange(H))
+        xx, yy = np.meshgrid(np.arange(w), np.arange(h))
 
-        # Apply mask if provided
-        if mask is not None:
-            valid = mask & (depth > 0)
-        else:
-            valid = depth > 0
+        # Unproject to 3D
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
 
-        # Extract valid coordinates
-        u_valid = u[valid]
-        v_valid = v[valid]
-        z_valid = depth[valid]
+        z = depth
+        x = (xx - cx) * z / fx
+        y = (yy - cy) * z / fy
 
-        # Convert depth to millimeters if needed (our loader gives meters)
-        if unit == 'mm':
-            z_valid = z_valid * 1000.0  # meters to millimeters
+        # Stack into XYZ
+        xyz = np.stack([x, y, z], axis=-1)
 
-        # Back-project to 3D using intrinsics
-        # X = (u - cx) * Z / fx
-        # Y = (v - cy) * Z / fy
-        x_valid = (u_valid - self.cx) * z_valid / self.fx
-        y_valid = (v_valid - self.cy) * z_valid / self.fy
+        return xyz
 
-        # Stack into (N, 3) array
-        points = np.stack([x_valid, y_valid, z_valid], axis=-1)
-
-        return points
-
-    def transform_points(self, points: np.ndarray, transform: np.ndarray) -> np.ndarray:
+    def process_rgbd_to_rgbddd(self, rgb: np.ndarray, depth: np.ndarray,
+                              K: np.ndarray, normalize_xyz: bool = True) -> np.ndarray:
         """
-        Apply 4x4 transformation matrix to points.
+        Convert RGB-D to RGBDDD format for model input.
 
         Args:
-            points: Points to transform (N, 3)
-            transform: 4x4 transformation matrix
+            rgb: (H, W, 3) RGB image, uint8 [0-255]
+            depth: (H, W) depth map in meters
+            K: 3x3 camera intrinsic matrix
+            normalize_xyz: Whether to normalize XYZ coordinates
 
         Returns:
-            transformed_points: Transformed points (N, 3)
+            (H, W, 6) RGBDDD array:
+            - [:,:,0:3]: RGB normalized to [0, 1]
+            - [:,:,3:6]: XYZ in meters (normalized if requested)
         """
-        # Convert to homogeneous coordinates
-        points_homo = np.concatenate([points, np.ones((len(points), 1))], axis=-1)
+        # Normalize RGB to [0, 1]
+        rgb_norm = rgb.astype(np.float32) / 255.0
 
-        # Apply transformation
-        transformed_homo = (transform @ points_homo.T).T
+        # Convert depth to XYZ
+        xyz = self.depth_to_xyz(depth, K)
 
-        # Convert back to 3D
-        transformed_points = transformed_homo[:, :3]
+        # Normalize XYZ if requested
+        if normalize_xyz:
+            # Normalize based on typical object distances (0.3-1.0m)
+            # This helps model convergence
+            xyz_norm = xyz.copy()
+            mask = depth > 0
+            if np.any(mask):
+                # Center around mean depth
+                mean_z = depth[mask].mean()
+                xyz_norm[..., 2] = (xyz_norm[..., 2] - mean_z) / mean_z
+                # Scale X,Y by same factor
+                xyz_norm[..., 0] = xyz_norm[..., 0] / mean_z
+                xyz_norm[..., 1] = xyz_norm[..., 1] / mean_z
+            xyz = xyz_norm
 
-        return transformed_points
+        # Stack RGBDDD
+        rgbddd = np.concatenate([rgb_norm, xyz], axis=-1).astype(np.float32)
 
-    def crop_depth_region(self, rgb: np.ndarray, depth: np.ndarray,
-                         mask: np.ndarray, padding: float = 1.4) -> Dict:
+        return rgbddd
+
+    def batch_process(self, rgbs: np.ndarray, depths: np.ndarray,
+                     Ks: np.ndarray, normalize_xyz: bool = True) -> np.ndarray:
         """
-        Crop RGB-D region around object mask with padding.
+        Process batch of RGB-D pairs.
 
         Args:
-            rgb: Color image (H, W, 3)
-            depth: Depth map in meters (H, W)
-            mask: Binary object mask (H, W)
-            padding: Padding factor for bounding box (1.4 = 40% padding)
+            rgbs: (N, H, W, 3) RGB images
+            depths: (N, H, W) depth maps in meters
+            Ks: (N, 3, 3) or (3, 3) camera intrinsics
+            normalize_xyz: Whether to normalize XYZ
 
         Returns:
-            dict with:
-                - 'rgb_crop': Cropped RGB (H_crop, W_crop, 3)
-                - 'depth_crop': Cropped depth (H_crop, W_crop)
-                - 'mask_crop': Cropped mask (H_crop, W_crop)
-                - 'bbox': Original bounding box [x, y, w, h]
-                - 'K_crop': Adjusted intrinsics for crop
+            (N, H, W, 6) batch of RGBDDD
         """
-        # Find bounding box of mask
-        coords = np.where(mask > 0)
-        if len(coords[0]) == 0:
-            raise ValueError("Empty mask provided")
+        batch_size = len(rgbs)
+        h, w = rgbs.shape[1:3]
 
-        y_min, y_max = coords[0].min(), coords[0].max()
-        x_min, x_max = coords[1].min(), coords[1].max()
+        # Handle single K for all images
+        if Ks.ndim == 2:
+            Ks = np.repeat(Ks[np.newaxis], batch_size, axis=0)
 
-        # Calculate center and size
-        cx = (x_min + x_max) / 2
-        cy = (y_min + y_max) / 2
-        w = x_max - x_min
-        h = y_max - y_min
+        # Process each image
+        rgbddd_batch = np.zeros((batch_size, h, w, 6), dtype=np.float32)
 
-        # Apply padding and make square
-        size = max(w, h) * padding
-        half_size = size / 2
+        for i in range(batch_size):
+            rgbddd_batch[i] = self.process_rgbd_to_rgbddd(
+                rgbs[i], depths[i], Ks[i], normalize_xyz
+            )
 
-        # Calculate padded box (ensure within image bounds)
-        H, W = rgb.shape[:2]
-        x1 = int(max(0, cx - half_size))
-        y1 = int(max(0, cy - half_size))
-        x2 = int(min(W, cx + half_size))
-        y2 = int(min(H, cy + half_size))
+        return rgbddd_batch
 
-        # Crop all inputs
-        rgb_crop = rgb[y1:y2, x1:x2]
-        depth_crop = depth[y1:y2, x1:x2]
-        mask_crop = mask[y1:y2, x1:x2]
+    def prepare_model_input(self, real_rgbddd: np.ndarray,
+                           rendered_rgbddd: np.ndarray) -> dict:
+        """
+        Prepare final input dict for models.
 
-        # Adjust camera intrinsics for crop
-        K_crop = self.K.copy()
-        K_crop[0, 2] -= x1  # Adjust cx
-        K_crop[1, 2] -= y1  # Adjust cy
+        Args:
+            real_rgbddd: (H, W, 6) or (1, H, W, 6) real image
+            rendered_rgbddd: (N, H, W, 6) rendered hypotheses
+
+        Returns:
+            Dict with 'input1' and 'input2' for model
+        """
+        # Ensure batch dimensions
+        if real_rgbddd.ndim == 3:
+            real_rgbddd = real_rgbddd[np.newaxis]
+
+        # Expand real to match rendered batch size
+        batch_size = len(rendered_rgbddd)
+        if len(real_rgbddd) == 1 and batch_size > 1:
+            real_rgbddd = np.repeat(real_rgbddd, batch_size, axis=0)
 
         return {
-            'rgb_crop': rgb_crop,
-            'depth_crop': depth_crop,
-            'mask_crop': mask_crop,
-            'bbox': [x1, y1, x2-x1, y2-y1],
-            'K_crop': K_crop
+            'input1': real_rgbddd,      # Real observation
+            'input2': rendered_rgbddd   # Rendered hypotheses
         }
 
-    def resize_for_model(self, rgb: np.ndarray, depth: np.ndarray,
-                        K: np.ndarray, target_size: int = 160) -> Dict:
-        """
-        Resize RGB-D to model input size (160x160 for FoundationPose).
 
-        Args:
-            rgb: Color image (H, W, 3)
-            depth: Depth map (H, W)
-            K: Camera intrinsics (3, 3)
-            target_size: Target size for model (default 160)
-
-        Returns:
-            dict with resized rgb, depth, and adjusted K
-        """
-        H, W = rgb.shape[:2]
-        scale = target_size / max(H, W)
-
-        # Calculate new dimensions
-        new_H = int(H * scale)
-        new_W = int(W * scale)
-
-        # Resize images
-        rgb_resized = cv2.resize(rgb, (new_W, new_H), interpolation=cv2.INTER_LINEAR)
-        depth_resized = cv2.resize(depth, (new_W, new_H), interpolation=cv2.INTER_NEAREST)
-
-        # Pad to square
-        pad_h = target_size - new_H
-        pad_w = target_size - new_W
-        pad_top = pad_h // 2
-        pad_left = pad_w // 2
-
-        rgb_padded = np.pad(rgb_resized,
-                           ((pad_top, pad_h - pad_top),
-                            (pad_left, pad_w - pad_left),
-                            (0, 0)),
-                           mode='constant')
-        depth_padded = np.pad(depth_resized,
-                            ((pad_top, pad_h - pad_top),
-                             (pad_left, pad_w - pad_left)),
-                            mode='constant')
-
-        # Adjust intrinsics
-        K_scaled = K.copy()
-        K_scaled[:2] *= scale
-        K_scaled[0, 2] += pad_left
-        K_scaled[1, 2] += pad_top
-
-        return {
-            'rgb': rgb_padded,
-            'depth': depth_padded,
-            'K': K_scaled,
-            'scale': scale,
-            'padding': (pad_top, pad_left)
-        }
-
-    def visualize_pointcloud(self, points: np.ndarray, colors: Optional[np.ndarray] = None,
-                           title: str = "Point Cloud"):
-        """Visualize 3D point cloud"""
-        fig = plt.figure(figsize=(10, 8))
-        ax = fig.add_subplot(111, projection='3d')
-
-        # Subsample for visualization
-        if len(points) > 10000:
-            idx = np.random.choice(len(points), 10000, replace=False)
-            points = points[idx]
-            if colors is not None:
-                colors = colors[idx]
-
-        if colors is None:
-            ax.scatter(points[:, 0], points[:, 1], points[:, 2],
-                      c=points[:, 2], cmap='viridis', s=1)
-        else:
-            ax.scatter(points[:, 0], points[:, 1], points[:, 2],
-                      c=colors/255.0, s=1)
-
-        ax.set_xlabel('X (m)')
-        ax.set_ylabel('Y (m)')
-        ax.set_zlabel('Z (m)')
-        ax.set_title(title)
-
-        # Set equal aspect ratio
-        max_range = np.array([points[:, 0].max()-points[:, 0].min(),
-                             points[:, 1].max()-points[:, 1].min(),
-                             points[:, 2].max()-points[:, 2].min()]).max() / 2.0
-        mid_x = (points[:, 0].max()+points[:, 0].min()) * 0.5
-        mid_y = (points[:, 1].max()+points[:, 1].min()) * 0.5
-        mid_z = (points[:, 2].max()+points[:, 2].min()) * 0.5
-        ax.set_xlim(mid_x - max_range, mid_x + max_range)
-        ax.set_ylim(mid_y - max_range, mid_y + max_range)
-        ax.set_zlim(mid_z - max_range, mid_z + max_range)
-
-        plt.show()
-
-
-# Example usage and visualization
+# Unit tests
 if __name__ == "__main__":
-    import sys
-    base_path = sys.argv[1] if len(sys.argv) > 1 else "."
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    from DataLoader import DataLoader
+    from MeshRenderer import MeshRenderer
+    from PoseGenerator import PoseGenerator
+    from CropProcessor import CropProcessor
 
-    # Initialize data loader
-    loader = LMODataLoader(base_path)
+    logging.basicConfig(level=logging.INFO)
 
-    # Initialize depth processor
-    processor = DepthProcessor(loader.K)
+    print("="*80)
+    print("Depth Processor Unit Tests")
+    print("="*80)
 
-    # Load a scene
+    # Initialize
+    processor = DepthProcessor()
+    loader = DataLoader("./data")
+
+    # Test 1: XYZ conversion
+    print("\nTest 1: Depth to XYZ Conversion")
+
+    # Create simple test depth
+    depth_test = np.ones((160, 160), dtype=np.float32) * 0.5  # 0.5m
+    K_test = np.array([[300, 0, 80],
+                       [0, 300, 80],
+                       [0, 0, 1]], dtype=np.float32)
+
+    xyz = processor.depth_to_xyz(depth_test, K_test)
+    print(f"XYZ shape: {xyz.shape}")
+    print(f"Center pixel XYZ: {xyz[80, 80]}")
+    print(f"Corner pixel XYZ: {xyz[0, 0]}")
+
+    # Test 2: Real image processing
+    print("\nTest 2: Real Image RGBDDD")
+
     scenes = loader.get_available_scenes()
     if scenes:
-        scene_data = loader.load_scene_data(scenes[0])
-
-        # Process first object in scene
-        if scene_data['masks'][0] is not None:
-            mask = scene_data['masks'][0]
-
-            # 1. Convert depth to point cloud
-            print("\n1. Converting depth to point cloud...")
-            points_cam = processor.depth_to_pointcloud(scene_data['depth'], mask, unit='mm')
-            print(f"   Generated {len(points_cam)} 3D points in camera frame")
-            print(f"   Point cloud bounds (mm):")
-            print(f"     X: [{points_cam[:, 0].min():.1f}, {points_cam[:, 0].max():.1f}]")
-            print(f"     Y: [{points_cam[:, 1].min():.1f}, {points_cam[:, 1].max():.1f}]")
-            print(f"     Z: [{points_cam[:, 2].min():.1f}, {points_cam[:, 2].max():.1f}]")
-
-            # Get colors for visualization
-            rgb = scene_data['rgb']
-            H, W = mask.shape
-            u, v = np.meshgrid(np.arange(W), np.arange(H))
-            valid = mask & (scene_data['depth'] > 0)
-            colors = rgb[valid]
-
-            # Visualize camera frame point cloud (convert to meters for display)
-            processor.visualize_pointcloud(points_cam / 1000.0, colors,
-                                         "Point Cloud in Camera Frame")
-
-            # 2. Transform to object frame
-            print("\n2. Transforming to object frame...")
-            pose = scene_data['poses'][0]  # Object to camera transform (mm)
-            obj_to_cam = pose
-            cam_to_obj = np.linalg.inv(obj_to_cam)
-            points_obj = processor.transform_points(points_cam, cam_to_obj)
-            print(f"   Point cloud in object frame bounds (mm):")
-            print(f"     X: [{points_obj[:, 0].min():.1f}, {points_obj[:, 0].max():.1f}]")
-            print(f"     Y: [{points_obj[:, 1].min():.1f}, {points_obj[:, 1].max():.1f}]")
-            print(f"     Z: [{points_obj[:, 2].min():.1f}, {points_obj[:, 2].max():.1f}]")
-
-            # 3. Crop region
-            print("\n3. Cropping object region...")
-            crop_result = processor.crop_depth_region(rgb, scene_data['depth'], mask)
-            print(f"   Original size: {rgb.shape[:2]}")
-            print(f"   Cropped size: {crop_result['rgb_crop'].shape[:2]}")
-            print(f"   Bounding box: {crop_result['bbox']}")
-
-            # 4. Resize for model
-            print("\n4. Resizing for model input...")
-            model_input = processor.resize_for_model(
-                crop_result['rgb_crop'],
-                crop_result['depth_crop'],
-                crop_result['K_crop']
+        data = loader.load_frame_data(scenes[0], 0)
+        if data['masks'][0] is not None:
+            # Crop to 160x160
+            crop_proc = CropProcessor()
+            cropped = crop_proc.apply_crop(
+                data['rgb'], data['depth'], data['masks'][0], data['K']
             )
-            print(f"   Model input size: {model_input['rgb'].shape[:2]}")
-            print(f"   Scale factor: {model_input['scale']:.3f}")
 
-            # Visualize processing pipeline
-            fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+            # Convert to RGBDDD
+            rgbddd = processor.process_rgbd_to_rgbddd(
+                cropped['rgb'], cropped['depth'], cropped['K']
+            )
 
-            # Original
-            axes[0, 0].imshow(rgb)
-            axes[0, 0].set_title("Original RGB")
-            axes[0, 0].axis('off')
+            print(f"RGBDDD shape: {rgbddd.shape}")
+            print(f"RGB range: [{rgbddd[:,:,0:3].min():.3f}, {rgbddd[:,:,0:3].max():.3f}]")
+            print(f"XYZ range: [{rgbddd[:,:,3:6].min():.3f}, {rgbddd[:,:,3:6].max():.3f}]")
 
-            axes[1, 0].imshow(scene_data['depth'], cmap='jet')
-            axes[1, 0].set_title("Original Depth")
-            axes[1, 0].axis('off')
+    # Test 3: Synthetic image processing
+    print("\nTest 3: Synthetic Image RGBDDD")
 
-            # Masked
-            rgb_masked = rgb.copy()
-            rgb_masked[~mask] = 0
-            axes[0, 1].imshow(rgb_masked)
-            axes[0, 1].set_title("Masked RGB")
-            axes[0, 1].axis('off')
+    mesh = loader.load_object_model(1)
+    pose_gen = PoseGenerator(mesh)
+    renderer = MeshRenderer(mesh)
 
-            depth_masked = scene_data['depth'].copy()
-            depth_masked[~mask] = 0
-            axes[1, 1].imshow(depth_masked, cmap='jet')
-            axes[1, 1].set_title("Masked Depth")
-            axes[1, 1].axis('off')
+    # Generate and render a pose
+    poses = pose_gen.generate_poses(n_poses=1)
+    rgb_synth, depth_synth = renderer.render(poses[0], loader.K, 160, 160)
 
-            # Model input
-            axes[0, 2].imshow(model_input['rgb'])
-            axes[0, 2].set_title("Model Input RGB (160x160)")
-            axes[0, 2].axis('off')
+    # Convert to RGBDDD
+    K_160 = loader.K.copy()
+    K_160[0, 0] *= 160/640  # Scale for 160x160
+    K_160[1, 1] *= 160/480
+    K_160[0, 2] *= 160/640
+    K_160[1, 2] *= 160/480
 
-            axes[1, 2].imshow(model_input['depth'], cmap='jet')
-            axes[1, 2].set_title("Model Input Depth (160x160)")
-            axes[1, 2].axis('off')
+    rgbddd_synth = processor.process_rgbd_to_rgbddd(
+        rgb_synth, depth_synth, K_160
+    )
 
-            plt.tight_layout()
-            plt.show()
+    print(f"Synthetic RGBDDD shape: {rgbddd_synth.shape}")
+    print(f"Synthetic RGB range: [{rgbddd_synth[:,:,0:3].min():.3f}, {rgbddd_synth[:,:,0:3].max():.3f}]")
+    print(f"Synthetic XYZ range: [{rgbddd_synth[:,:,3:6].min():.3f}, {rgbddd_synth[:,:,3:6].max():.3f}]")
+
+    # Test 4: Batch processing
+    print("\nTest 4: Batch Processing")
+
+    if 'rgbddd' in locals() and 'rgbddd_synth' in locals():
+        # Prepare model input
+        model_input = processor.prepare_model_input(
+            rgbddd,
+            np.stack([rgbddd_synth] * 4)  # 4 hypotheses
+        )
+
+        print(f"Model input1 shape: {model_input['input1'].shape}")
+        print(f"Model input2 shape: {model_input['input2'].shape}")
+
+    # Visualize
+    fig, axes = plt.subplots(2, 5, figsize=(20, 8))
+    fig.suptitle('RGBDDD Processing (Real vs Synthetic)', fontsize=16)
+
+    if 'rgbddd' in locals():
+        # Real image - top row
+        axes[0, 0].imshow(cropped['rgb'])
+        axes[0, 0].set_title('Real RGB')
+        axes[0, 0].axis('off')
+
+        axes[0, 1].imshow(cropped['depth'], cmap='viridis')
+        axes[0, 1].set_title('Real Depth (m)')
+        axes[0, 1].axis('off')
+
+        # Real XYZ
+        for i in range(3):
+            im = axes[0, i+2].imshow(rgbddd[:,:,i+3], cmap='RdBu')
+            axes[0, i+2].set_title(['X (left-right)', 'Y (up-down)', 'Z (depth)'][i])
+            axes[0, i+2].axis('off')
+            plt.colorbar(im, ax=axes[0, i+2], fraction=0.046, pad=0.04)
+
+    if 'rgbddd_synth' in locals():
+        # Synthetic - bottom row
+        axes[1, 0].imshow(rgb_synth)
+        axes[1, 0].set_title('Synthetic RGB')
+        axes[1, 0].axis('off')
+
+        axes[1, 1].imshow(depth_synth, cmap='viridis')
+        axes[1, 1].set_title('Synthetic Depth (m)')
+        axes[1, 1].axis('off')
+
+        # Synthetic XYZ
+        for i in range(3):
+            im = axes[1, i+2].imshow(rgbddd_synth[:,:,i+3], cmap='RdBu')
+            axes[1, i+2].set_title(['X (left-right)', 'Y (up-down)', 'Z (depth)'][i])
+            axes[1, i+2].axis('off')
+            plt.colorbar(im, ax=axes[1, i+2], fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+
+    # Save
+    from pathlib import Path
+    viz_dir = Path("viz")
+    viz_dir.mkdir(exist_ok=True)
+    plt.savefig(viz_dir / 'depthprocessor_test.png', dpi=150, bbox_inches='tight')
+    print(f"\nVisualization saved to: {viz_dir / 'depthprocessor_test.png'}")
+
+    print("\n" + "="*80)
+    print("All tests passed!")
+    print("="*80)
