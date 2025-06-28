@@ -258,7 +258,7 @@ class ModelInterface:
             rendered_rgbddd: (N, 160, 160, 6) rendered views
 
         Returns:
-            (N,) scores
+            (1, N) scores
         """
         n_poses = len(rendered_rgbddd)
         all_scores = np.empty(n_poses, dtype=np.float32)
@@ -414,17 +414,11 @@ if __name__ == "__main__":
         t_score = time.time() - t0
 
         # --- Report results ---
-        # Throughput in poses per second
-        refine_hz = n_poses / t_refine
-        score_hz = n_poses / t_score
+        t_per_iter = t_refine / 5
 
-        print(f"  Refine (5 iter): {t_refine*1000:.1f} ms ({refine_hz:.1f} poses/sec)")
-        print(f"  Score:           {t_score*1000:.1f} ms ({score_hz:.1f} poses/sec)")
+        print(f"  Refine (5 iter): {t_refine*1000:.1f} ms ({t_per_iter:.1f} sec/iter)")
+        print(f"  Score:           {t_score*1000:.1f} ms")
         print(f"  Total pipeline:  {(t_refine + t_score)*1000:.1f} ms")
-
-        # Calculate throughput for a combined pipeline (one refine pass + one score pass)
-        pipeline_hz = n_poses / (t_refine/5 + t_score) # NOTE: normalize refine time to 1 iteration
-        print(f"  Pipeline throughput (1 iter refine + score): {pipeline_hz:.1f} poses/sec")
 
     print("\n" + "="*80)
     print("Tests complete!")
