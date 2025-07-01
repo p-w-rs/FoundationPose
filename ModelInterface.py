@@ -1,7 +1,5 @@
 import numpy as np
 import tensorrt as trt
-import pycuda.driver as cuda
-import pycuda.autoinit
 from typing import Dict, List, Tuple, Optional
 import logging
 from pathlib import Path
@@ -9,6 +7,19 @@ import cv2
 
 # TensorRT logger
 TRT_LOGGER = trt.Logger(trt.Logger.WARNING)
+
+# Handle CUDA context - use shared manager if available, else autoinit
+try:
+    from CUDAContext import CUDAContextManager
+    USE_SHARED_CONTEXT = True
+except ImportError:
+    USE_SHARED_CONTEXT = False
+
+# Import pycuda
+import pycuda.driver as cuda
+if not USE_SHARED_CONTEXT:
+    import pycuda.autoinit
+
 
 class ModelInterface:
     """
@@ -51,8 +62,13 @@ class ModelInterface:
         self.refiner_context = None
         self.scorer_context = None
 
-        # CUDA stream
-        self.stream = cuda.Stream()
+        # CUDA context manager
+        self.cuda_mgr = None
+        if USE_SHARED_CONTEXT:
+            self.cuda_mgr = CUDAContextManager.get_instance()
+            self.stream = self.cuda_mgr.get_pycuda_stream()
+        else:
+            self.stream = cuda.Stream()
 
         # Allocated buffers
         self.refiner_buffers = {}
@@ -98,59 +114,126 @@ class ModelInterface:
         # Try loading cached engine
         if engine_path.exists():
             self.logger.info(f"Loading cached {model_name} engine from {engine_path}")
-            with open(engine_path, 'rb') as f:
-                runtime = trt.Runtime(TRT_LOGGER)
-                return runtime.deserialize_cuda_engine(f.read())
+            try:
+                with open(engine_path, 'rb') as f:
+                    runtime = trt.Runtime(TRT_LOGGER)
+                    engine = runtime.deserialize_cuda_engine(f.read())
+                    if engine is None:
+                        self.logger.warning(f"Failed to deserialize cached engine, rebuilding...")
+                        engine_path.unlink()  # Remove corrupted cache
+                    else:
+                        return engine
+            except Exception as e:
+                self.logger.warning(f"Error loading cached engine: {e}, rebuilding...")
+                engine_path.unlink()  # Remove corrupted cache
 
         # Build new engine
         self.logger.info(f"Building {model_name} engine from {onnx_path}")
-        builder = trt.Builder(TRT_LOGGER)
+
+        # Create builder with more verbose logging for debugging
+        if hasattr(trt.Logger, 'VERBOSE'):
+            verbose_logger = trt.Logger(trt.Logger.INFO)
+        else:
+            verbose_logger = TRT_LOGGER
+
+        builder = trt.Builder(verbose_logger)
         network = builder.create_network(
             1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
         )
-        parser = trt.OnnxParser(network, TRT_LOGGER)
+        parser = trt.OnnxParser(network, verbose_logger)
 
         # Parse ONNX
+        if not onnx_path.exists():
+            raise FileNotFoundError(f"ONNX file not found: {onnx_path}")
+
         with open(onnx_path, 'rb') as f:
-            if not parser.parse(f.read()):
-                for error in range(parser.num_errors):
-                    self.logger.error(parser.get_error(error))
+            onnx_data = f.read()
+            if not parser.parse(onnx_data):
+                self.logger.error(f"Failed to parse ONNX file: {onnx_path}")
+                for i in range(parser.num_errors):
+                    error = parser.get_error(i)
+                    self.logger.error(f"Parser error {i}: {error}")
                 raise RuntimeError(f"Failed to parse {onnx_path}")
+
+        self.logger.info(f"Network has {network.num_inputs} inputs and {network.num_outputs} outputs")
+
+        # Log network inputs/outputs for debugging
+        for i in range(network.num_inputs):
+            input_tensor = network.get_input(i)
+            self.logger.info(f"Input {i}: {input_tensor.name}, shape: {input_tensor.shape}, dtype: {input_tensor.dtype}")
+
+        for i in range(network.num_outputs):
+            output_tensor = network.get_output(i)
+            self.logger.info(f"Output {i}: {output_tensor.name}, shape: {output_tensor.shape}, dtype: {output_tensor.dtype}")
 
         # Configure builder
         config = builder.create_builder_config()
-        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 8 << 30) # 8GB
 
-        if self.use_fp16:
+        # Set workspace size (reduce if you have memory issues)
+        workspace_size = 4 << 30  # 4GB (reduced from 8GB)
+        config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_size)
+        self.logger.info(f"Set workspace size to {workspace_size / (1<<30):.1f} GB")
+
+        # Set precision
+        if self.use_fp16 and builder.platform_has_fast_fp16:
             config.set_flag(trt.BuilderFlag.FP16)
+            self.logger.info("Enabled FP16 precision")
+        else:
+            self.logger.info("Using FP32 precision")
+
+        # Disable specific tactics that might cause Cask errors
+        if hasattr(trt.BuilderFlag, 'DISABLE_TIMING_CACHE'):
+            config.set_flag(trt.BuilderFlag.DISABLE_TIMING_CACHE)
 
         # Set optimization profiles for dynamic batch
         profile = builder.create_optimization_profile()
         for i in range(network.num_inputs):
             input_tensor = network.get_input(i)
             # Dynamic batch dimension is first
-            min_shape = list(input_tensor.shape)
-            opt_shape = list(input_tensor.shape)
-            max_shape = list(input_tensor.shape)
+            shape = list(input_tensor.shape)
+            min_shape = shape.copy()
+            opt_shape = shape.copy()
+            max_shape = shape.copy()
 
             min_shape[0] = 1
             opt_shape[0] = self.opt_batch_size
             max_shape[0] = self.max_batch_size
 
+            self.logger.info(f"Setting shape for {input_tensor.name}: "
+                           f"min={min_shape}, opt={opt_shape}, max={max_shape}")
             profile.set_shape(input_tensor.name, min_shape, opt_shape, max_shape)
+
         config.add_optimization_profile(profile)
 
         # Build engine
+        self.logger.info(f"Building {model_name} engine... This may take several minutes.")
         serialized_engine = builder.build_serialized_network(network, config)
+
         if serialized_engine is None:
+            self.logger.error("Failed to build engine")
+            # Get more detailed error info
+            if hasattr(builder, 'get_error_recorder'):
+                error_recorder = builder.get_error_recorder()
+                if error_recorder and hasattr(error_recorder, 'num_errors'):
+                    for i in range(error_recorder.num_errors):
+                        self.logger.error(f"Build error {i}: {error_recorder.get_error(i)}")
             raise RuntimeError(f"Failed to build {model_name} engine")
 
+        self.logger.info(f"Engine built successfully, size: {len(serialized_engine) / (1<<20):.1f} MB")
+
         # Save engine
+        engine_path.parent.mkdir(parents=True, exist_ok=True)
         with open(engine_path, 'wb') as f:
             f.write(serialized_engine)
+        self.logger.info(f"Saved engine to {engine_path}")
 
         runtime = trt.Runtime(TRT_LOGGER)
-        return runtime.deserialize_cuda_engine(serialized_engine)
+        engine = runtime.deserialize_cuda_engine(serialized_engine)
+
+        if engine is None:
+            raise RuntimeError(f"Failed to deserialize {model_name} engine")
+
+        return engine
 
     def _allocate_buffers(self, engine: trt.ICudaEngine, buffers: Dict):
         """
@@ -159,6 +242,15 @@ class ModelInterface:
         Handles dynamic dimensions by using max_batch_size for allocation.
         Buffer info includes shape, dtype, and whether it's an input.
         """
+        # Wrap in context if using shared manager
+        if self.cuda_mgr:
+            with self.cuda_mgr.activate_tensorrt():
+                self._do_allocate_buffers(engine, buffers)
+        else:
+            self._do_allocate_buffers(engine, buffers)
+
+    def _do_allocate_buffers(self, engine: trt.ICudaEngine, buffers: Dict):
+        """Internal buffer allocation logic."""
         for i in range(engine.num_io_tensors):
             name = engine.get_tensor_name(i)
             dtype = trt.nptype(engine.get_tensor_dtype(name))
@@ -166,9 +258,9 @@ class ModelInterface:
             is_input = engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
 
             # Handle dynamic dimensions (-1) by using max batch size
-            for i, dim in enumerate(shape):
+            for j, dim in enumerate(shape):
                 if dim == -1:
-                    shape[i] = self.max_batch_size
+                    shape[j] = self.max_batch_size
 
             # Calculate buffer size using int64 to prevent overflow
             size = int(np.prod(shape, dtype=np.int64) * np.dtype(dtype).itemsize)
@@ -203,6 +295,15 @@ class ModelInterface:
         Returns:
             (N, 4, 4) refined poses in float32
         """
+        if self.cuda_mgr:
+            with self.cuda_mgr.activate_tensorrt():
+                return self._do_refine_poses_batch(poses, real_rgbddd, rendered_rgbddd)
+        else:
+            return self._do_refine_poses_batch(poses, real_rgbddd, rendered_rgbddd)
+
+    def _do_refine_poses_batch(self, poses: np.ndarray, real_rgbddd: np.ndarray,
+                               rendered_rgbddd: np.ndarray) -> np.ndarray:
+        """Internal refinement logic."""
         n_poses = len(poses)
         current_poses = poses.copy()
 
@@ -276,6 +377,15 @@ class ModelInterface:
         Returns:
             (N,) scores in float32
         """
+        if self.cuda_mgr:
+            with self.cuda_mgr.activate_tensorrt():
+                return self._do_score_poses_batch(real_rgbddd, rendered_rgbddd)
+        else:
+            return self._do_score_poses_batch(real_rgbddd, rendered_rgbddd)
+
+    def _do_score_poses_batch(self, real_rgbddd: np.ndarray,
+                              rendered_rgbddd: np.ndarray) -> np.ndarray:
+        """Internal scoring logic."""
         n_poses = len(rendered_rgbddd)
 
         # Ensure real observation is batched
@@ -362,9 +472,10 @@ class ModelInterface:
         self.logger.info(f"Warming up with batch size {warmup_batch_size}...")
 
         dummy_rgbddd = np.random.randn(warmup_batch_size, 160, 160, 6).astype(np.float32)
-        dummy_rgbddd[:, :, :3] = np.clip(dummy_rgbddd[:, :, :3], 0, 1)  # Clip RGB to valid range
+        dummy_rgbddd[:, :, :, :3] = np.clip(dummy_rgbddd[:, :, :, :3], 0, 1)  # Clip RGB to valid range
         dummy_poses = np.tile(np.eye(4), (warmup_batch_size, 1, 1)).astype(np.float32)
 
+        # Warmup with proper context handling
         for _ in range(3):
             self.refine_poses_batch(dummy_poses, dummy_rgbddd, dummy_rgbddd)
             self.score_poses_batch(dummy_rgbddd, dummy_rgbddd)

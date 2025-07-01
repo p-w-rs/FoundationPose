@@ -6,6 +6,13 @@ from typing import Tuple, Optional, Union
 import cv2
 import logging
 
+# Handle CUDA context - use shared manager if available
+try:
+    from CUDAContext import CUDAContextManager
+    USE_SHARED_CONTEXT = True
+except ImportError:
+    USE_SHARED_CONTEXT = False
+
 class MeshRenderer:
     """
     GPU-accelerated mesh renderer using nvdiffrast for FoundationPose.
@@ -37,8 +44,15 @@ class MeshRenderer:
         self.device = torch.device(device)
         self.logger = logging.getLogger(__name__)
 
-        # Initialize nvdiffrast context
-        self.glctx = dr.RasterizeCudaContext(device=self.device)
+        # Get CUDA context manager if available
+        self.cuda_mgr = None
+        if USE_SHARED_CONTEXT:
+            self.cuda_mgr = CUDAContextManager.get_instance()
+            # Initialize nvdiffrast context through manager
+            self.glctx = self.cuda_mgr.get_nvdiff_context()
+        else:
+            # Create own context
+            self.glctx = dr.RasterizeCudaContext(device=self.device)
 
         # Load mesh to GPU
         self.vertices = torch.from_numpy(
@@ -115,6 +129,17 @@ class MeshRenderer:
             - rgbs: (N, H, W, 3) uint8 RGB images
             - depths: (N, H, W) float32 depth in meters
         """
+        # Wrap rendering in context if using shared manager
+        if self.cuda_mgr:
+            with self.cuda_mgr.activate_nvdiffrast():
+                return self._do_render_batch(poses, K, width, height, z_near, z_far)
+        else:
+            return self._do_render_batch(poses, K, width, height, z_near, z_far)
+
+    def _do_render_batch(self, poses: np.ndarray, K: np.ndarray,
+                         width: int, height: int,
+                         z_near: float, z_far: float) -> Tuple[np.ndarray, np.ndarray]:
+        """Internal rendering logic."""
         batch_size = len(poses)
 
         # Scale intrinsics if rendering at different resolution
@@ -123,8 +148,8 @@ class MeshRenderer:
         scale_x = width / 640.0
         scale_y = height / 480.0
         K_scaled[0, 0] *= scale_x  # fx
-        K_scaled[1, 1] *= scale_y  # fy
         K_scaled[0, 2] *= scale_x  # cx
+        K_scaled[1, 1] *= scale_y  # fy
         K_scaled[1, 2] *= scale_y  # cy
 
         # Convert to torch
@@ -240,6 +265,15 @@ class MeshRenderer:
 
     def set_mesh(self, mesh: trimesh.Trimesh):
         """Update the mesh for rendering."""
+        # Wrap mesh update in context if using shared manager
+        if self.cuda_mgr:
+            with self.cuda_mgr.activate_nvdiffrast():
+                self._do_set_mesh(mesh)
+        else:
+            self._do_set_mesh(mesh)
+
+    def _do_set_mesh(self, mesh: trimesh.Trimesh):
+        """Internal mesh update logic."""
         self.vertices = torch.from_numpy(
             mesh.vertices.astype(np.float32)
         ).to(self.device)
@@ -261,6 +295,8 @@ class MeshRenderer:
 
         self.n_vertices = len(mesh.vertices)
         self.n_faces = len(mesh.faces)
+        self.mesh_center = mesh.vertices.mean(axis=0)
+        self.mesh_scale = np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
 
 
 # Unit tests
@@ -275,6 +311,12 @@ if __name__ == "__main__":
     print("="*80)
     print("Mesh Renderer Unit Tests")
     print("="*80)
+
+    # Check if shared context is available
+    if USE_SHARED_CONTEXT:
+        print("Using shared CUDA context manager")
+    else:
+        print("Using standalone mode (no shared context)")
 
     # Load test data
     loader = DataLoader("./data")
@@ -359,6 +401,15 @@ if __name__ == "__main__":
             if depth_synth[depth_synth > 0].size > 0:
                 print(f"Synth depth range: {depth_synth[depth_synth > 0].min():.3f} - "
                       f"{depth_synth[depth_synth > 0].max():.3f} m")
+
+    # Test 4: Mesh switching
+    print("\nTest 4: Mesh Switching")
+    if len(loader.object_ids) > 1:
+        mesh2 = loader.load_object_model(loader.object_ids[1])
+        renderer.set_mesh(mesh2)
+        rgb2, depth2 = renderer.render(pose, loader.K, 160, 160)
+        print(f"Switched to object {loader.object_ids[1]}")
+        print(f"New mesh scale: {renderer.mesh_scale:.3f}m")
 
     # Visualize results
     fig, axes = plt.subplots(3, n_poses, figsize=(2*n_poses, 6))
