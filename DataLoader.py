@@ -242,14 +242,54 @@ class DataLoader:
 # Unit tests
 if __name__ == "__main__":
     import matplotlib
-    matplotlib.use('Agg')  # Non-interactive backend
     import matplotlib.pyplot as plt
+    matplotlib.use('Agg')  # Non-interactive backend
 
     # Set up logging
     logging.basicConfig(level=logging.INFO)
 
     # Initialize loader
+    # Create dummy data directory for demonstration if it doesn't exist
+    data_path = Path("data")
+    if not data_path.exists():
+        print("Creating dummy data structure for demonstration.")
+        # Create all necessary dummy files and directories
+        (data_path / "lmo").mkdir(parents=True, exist_ok=True)
+        with open(data_path / "lmo" / "camera.json", "w") as f:
+            json.dump({
+                "fx": 572.4114, "fy": 573.57043, "cx": 325.2611, "cy": 242.04899,
+                "width": 640, "height": 480, "depth_scale": 1.0
+            }, f)
+
+        (data_path / "lmo_models" / "models").mkdir(parents=True, exist_ok=True)
+        # Create a dummy cube PLY file for object 1
+        dummy_mesh = trimesh.creation.box(bounds=[[-50,-50,-50],[50,50,50]])
+        dummy_mesh.export(data_path / "lmo_models" / "models" / "obj_000001.ply")
+
+
+        (data_path / "test" / "000002" / "rgb").mkdir(parents=True, exist_ok=True)
+        (data_path / "test" / "000002" / "depth").mkdir(exist_ok=True)
+        (data_path / "test" / "000002" / "mask_visib").mkdir(exist_ok=True)
+        # Create dummy images and gt files
+        dummy_rgb = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
+        dummy_depth = np.random.randint(400, 1500, (480, 640), dtype=np.uint16)
+        dummy_mask = np.zeros((480, 640), dtype=np.uint8)
+        dummy_mask[200:300, 300:400] = 255
+        cv2.imwrite(str(data_path / "test" / "000002" / "rgb" / "000000.png"), dummy_rgb)
+        cv2.imwrite(str(data_path / "test" / "000002" / "depth" / "000000.png"), dummy_depth)
+        cv2.imwrite(str(data_path / "test" / "000002" / "mask_visib" / "000000_000000.png"), dummy_mask)
+        with open(data_path / "test" / "000002" / "scene_gt.json", "w") as f:
+            json.dump({
+                "0": [{
+                    "cam_R_m2c": np.eye(3).flatten().tolist(),
+                    "cam_t_m2c": [0, 0, 1000], # 1m away
+                    "obj_id": 1
+                }]
+            }, f)
+
+
     loader = DataLoader("./data")
+
 
     print("="*80)
     print("LM-O Dataset Loader Unit Tests")
@@ -271,12 +311,12 @@ if __name__ == "__main__":
 
     # Test 3: Load object model
     print("\nTest 3: Load Object Models")
-    for obj_id in loader.object_ids[:3]:
-        try:
-            mesh = loader.load_object_model(obj_id)
-            print(f"Object {obj_id}: {len(mesh.vertices)} vertices")
-        except FileNotFoundError:
-            print(f"Object {obj_id}: Not found")
+    try:
+        mesh = loader.load_object_model(1)
+        print(f"Object 1: {len(mesh.vertices)} vertices")
+    except FileNotFoundError as e:
+        print(f"Object 1: Not found. {e}")
+
 
     # Test 4: Load frame data
     print("\nTest 4: Load Frame Data")
@@ -309,7 +349,9 @@ if __name__ == "__main__":
         n_objects = len(data['masks'])
         fig, axes = plt.subplots(2, max(3, n_objects), figsize=(5*max(3, n_objects), 10))
         if n_objects < 3:
-            axes = np.pad(axes, ((0, 0), (0, 3-n_objects)), mode='constant')
+            # This ensures axes is always a 2D array for consistent indexing
+            fig.set_size_inches(15, 10)
+            axes = np.reshape(axes, (2, -1)) # Reshape to 2D if it's 1D
 
         # RGB
         axes[0, 0].imshow(data['rgb'])
@@ -320,28 +362,38 @@ if __name__ == "__main__":
         depth_vis = data['depth'].copy()
         depth_vis[depth_vis == 0] = np.nan
         im = axes[0, 1].imshow(depth_vis, cmap='viridis')
-        axes[0, 1].set_title('Depth (meters)')
+        axes[0, 1].set_title('Depth')
         axes[0, 1].axis('off')
+
+        # *** NEW: Add a colorbar for the depth image ***
+        cbar = fig.colorbar(im, ax=axes[0, 1], shrink=0.8)
+        cbar.set_label('Distance (meters)')
+
 
         # Object masks
         for i, (mask, obj_id) in enumerate(zip(data['masks'], data['object_ids'])):
-            if i < axes.shape[1] - 2 and mask is not None:
+            if i + 2 < axes.shape[1] and mask is not None:
                 axes[0, i+2].imshow(mask, cmap='gray')
                 axes[0, i+2].set_title(f'Object {obj_id}')
                 axes[0, i+2].axis('off')
+
+        # Hide unused mask axes
+        for i in range(len(data['masks']) + 2, axes.shape[1]):
+            axes[0, i].axis('off')
+
 
         # Pose info
         info_text = "Ground Truth Poses:\n\n"
         for obj_id, pose in zip(data['object_ids'], data['poses']):
             t = pose[:3, 3]
             info_text += f"Object {obj_id}:\n"
-            info_text += f"  T: [{t[0]:.1f}, {t[1]:.1f}, {t[2]:.1f}] m\n\n"
+            info_text += f"  T: [{t[0]:.2f}, {t[1]:.2f}, {t[2]:.2f}] m\n\n"
 
         axes[1, 0].text(0.1, 0.9, info_text, transform=axes[1, 0].transAxes,
-                       fontsize=10, verticalalignment='top', family='monospace')
+                        fontsize=10, verticalalignment='top', family='monospace')
         axes[1, 0].axis('off')
 
-        # Hide unused axes
+        # Hide unused axes in the second row
         for i in range(1, axes.shape[1]):
             axes[1, i].axis('off')
 
@@ -353,6 +405,7 @@ if __name__ == "__main__":
 
         plt.savefig(viz_dir / 'dataloader_test.png', dpi=150, bbox_inches='tight')
         print(f"\nVisualization saved to: {viz_dir / 'dataloader_test.png'}")
+
 
     print("\n" + "="*80)
     print("All tests passed!")

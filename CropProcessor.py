@@ -231,7 +231,7 @@ if __name__ == "__main__":
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    from DataLoader import DataLoader
+    from DataLoader import DataLoader # Assuming DataLoader is in a separate file
 
     logging.basicConfig(level=logging.INFO)
 
@@ -249,42 +249,46 @@ if __name__ == "__main__":
         print("No scenes found")
         exit()
 
-    data = loader.load_frame_data(scenes[0], 0)
+    # Use a scene and frame that are known to exist
+    scene_id_to_test = scenes[0]
+    frames_in_scene = loader.get_scene_frames(scene_id_to_test)
+    if not frames_in_scene:
+        print(f"No frames found in scene {scene_id_to_test}")
+        exit()
+    frame_id_to_test = frames_in_scene[0]
+
+    data = loader.load_frame_data(scene_id_to_test, frame_id_to_test)
+
+    # Find the first valid mask to process
+    first_valid_mask_idx = -1
+    for i, m in enumerate(data['masks']):
+        if m is not None and np.any(m):
+            first_valid_mask_idx = i
+            break
+
+    if first_valid_mask_idx == -1:
+        print("No valid objects found in the test frame.")
+        exit()
+
+    mask_to_process = data['masks'][first_valid_mask_idx]
 
     # Test 1: Compute crop from mask
     print("\nTest 1: Compute Crop from Mask")
-    if data['masks'] and data['masks'][0] is not None:
-        mask = data['masks'][0]
-        crop_info = processor.compute_crop_from_mask(mask)
-        print(f"Crop info: {crop_info}")
-        print(f"Object bbox: {crop_info['bbox']}")
-        print(f"Crop size: {crop_info['size']:.1f} pixels")
+    crop_info = processor.compute_crop_from_mask(mask_to_process)
+    print(f"Crop info: {crop_info}")
 
     # Test 2: Apply crop
     print("\nTest 2: Apply Crop")
-    if data['masks'] and data['masks'][0] is not None:
-        result = processor.apply_crop(
-            data['rgb'], data['depth'], data['masks'][0], data['K']
-        )
+    result = processor.apply_crop(
+        data['rgb'], data['depth'], mask_to_process, data['K']
+    )
+    print(f"Adjusted K:\n{result['K']}")
 
-        print(f"Original RGB shape: {data['rgb'].shape}")
-        print(f"Cropped RGB shape: {result['rgb'].shape}")
-        print(f"Original K:\n{data['K']}")
-        print(f"Adjusted K:\n{result['K']}")
-
-    # Test 3: Batch processing
-    print("\nTest 3: Batch Processing")
-    if len(data['masks']) > 1:
-        batch_results = processor.batch_apply_crops(
-            data['rgb'], data['depth'], data['masks'][:3], data['K']
-        )
-        print(f"Processed {len(batch_results['rgbs'])} objects")
-
-    # Visualize
-    fig, axes = plt.subplots(3, 4, figsize=(16, 12))
+    # --- Visualization ---
+    fig, axes = plt.subplots(2, 4, figsize=(16, 9))
     fig.suptitle('Crop Processing Results', fontsize=16)
 
-    # Original image with bbox
+    # --- Row 1: Original Data ---
     ax = axes[0, 0]
     ax.imshow(data['rgb'])
     if crop_info['valid']:
@@ -293,81 +297,67 @@ if __name__ == "__main__":
         ax.add_patch(rect)
         cx, cy = crop_info['center']
         size = crop_info['size']
-        square = plt.Rectangle((cx-size/2, cy-size/2), size, size,
-                             fill=False, color='g', linewidth=2, linestyle='--')
+        square = plt.Rectangle((cx - size / 2, cy - size / 2), size, size,
+                               fill=False, color='g', linewidth=2, linestyle='--')
         ax.add_patch(square)
-    ax.set_title('Original + Bbox')
+    ax.set_title('Original + BBox')
     ax.axis('off')
 
-    # Original depth
+    # Prepare original depth for visualization
     ax = axes[0, 1]
     depth_vis = data['depth'].copy()
-    depth_vis[depth_vis == 0] = np.nan
-    ax.imshow(depth_vis, cmap='viridis')
+    valid_depth = depth_vis[depth_vis > 0]
+    vmin, vmax = (valid_depth.min(), valid_depth.max()) if valid_depth.size > 0 else (0,1)
+    depth_vis[depth_vis == 0] = np.nan # Set 0 to NaN for transparent plotting
+
+    im1 = ax.imshow(depth_vis, cmap='viridis', vmin=vmin, vmax=vmax)
     ax.set_title('Original Depth')
     ax.axis('off')
 
-    # Original mask
+    # *** ADDED: Colorbar for Original Depth ***
+    cbar1 = fig.colorbar(im1, ax=ax, fraction=0.046, pad=0.04)
+    cbar1.set_label('Distance (meters)')
+
     ax = axes[0, 2]
-    if data['masks'] and data['masks'][0] is not None:
-        ax.imshow(data['masks'][0], cmap='gray')
+    ax.imshow(mask_to_process, cmap='gray')
     ax.set_title('Original Mask')
     ax.axis('off')
 
-    # Info text
-    ax = axes[0, 3]
-    info_text = f"Target size: {processor.target_size}x{processor.target_size}\n"
-    info_text += f"Padding factor: 1.4\n\n"
-    if crop_info['valid']:
-        info_text += f"Crop center: ({crop_info['center'][0]:.0f}, {crop_info['center'][1]:.0f})\n"
-        info_text += f"Crop size: {crop_info['size']:.0f}\n"
-        info_text += f"Scale factor: {result['crop_info']['scale']:.2f}"
-    ax.text(0.1, 0.9, info_text, transform=ax.transAxes,
-            fontsize=10, verticalalignment='top', family='monospace')
+    # --- Row 2: Cropped Results ---
+    axes[1, 0].imshow(result['rgb'])
+    axes[1, 0].set_title('Cropped RGB (160x160)')
+    axes[1, 0].axis('off')
+
+    ax = axes[1, 1]
+    depth_crop_vis = result['depth'].copy()
+    depth_crop_vis[depth_crop_vis == 0] = np.nan
+
+    # *** MODIFIED: Use vmin/vmax from original depth for consistent colors ***
+    im2 = ax.imshow(depth_crop_vis, cmap='viridis', vmin=vmin, vmax=vmax)
+    ax.set_title('Cropped Depth (160x160)')
     ax.axis('off')
 
-    # Cropped results
-    if 'result' in locals():
-        # Cropped RGB
-        axes[1, 0].imshow(result['rgb'])
-        axes[1, 0].set_title('Cropped RGB (160x160)')
-        axes[1, 0].axis('off')
+    # *** ADDED: Colorbar for Cropped Depth ***
+    cbar2 = fig.colorbar(im2, ax=ax, fraction=0.046, pad=0.04)
+    cbar2.set_label('Distance (meters)')
 
-        # Cropped depth
-        depth_crop_vis = result['depth'].copy()
-        if depth_crop_vis[depth_crop_vis > 0].size > 0:
-            vmin = depth_crop_vis[depth_crop_vis > 0].min()
-            vmax = depth_crop_vis[depth_crop_vis > 0].max()
-            depth_crop_vis[depth_crop_vis == 0] = np.nan
-            axes[1, 1].imshow(depth_crop_vis, cmap='viridis', vmin=vmin, vmax=vmax)
-        axes[1, 1].set_title('Cropped Depth (160x160)')
-        axes[1, 1].axis('off')
-
-        # Cropped mask
-        axes[1, 2].imshow(result['mask'], cmap='gray')
-        axes[1, 2].set_title('Cropped Mask (160x160)')
-        axes[1, 2].axis('off')
-
-    # Multiple objects if available
-    if 'batch_results' in locals():
-        for i in range(min(3, len(batch_results['rgbs']))):
-            axes[2, i].imshow(batch_results['rgbs'][i])
-            axes[2, i].set_title(f'Object {i}')
-            axes[2, i].axis('off')
+    axes[1, 2].imshow(result['mask'], cmap='gray')
+    axes[1, 2].set_title('Cropped Mask (160x160)')
+    axes[1, 2].axis('off')
 
     # Hide unused axes
-    for ax in axes.flat:
-        if not ax.has_data():
-            ax.axis('off')
+    axes[0, 3].axis('off')
+    axes[1, 3].axis('off')
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
     # Save
     from pathlib import Path
     viz_dir = Path("viz")
     viz_dir.mkdir(exist_ok=True)
-    plt.savefig(viz_dir / 'cropprocessor_test.png', dpi=150, bbox_inches='tight')
-    print(f"\nVisualization saved to: {viz_dir / 'cropprocessor_test.png'}")
+    save_path = viz_dir / 'cropprocessor_test.png'
+    plt.savefig(save_path, dpi=150)
+    print(f"\nVisualization saved to: {save_path}")
 
     print("\n" + "="*80)
     print("All tests passed!")
