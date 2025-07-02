@@ -1,287 +1,206 @@
+# MeshRenderer.py
+
 import numpy as np
 import torch
 import nvdiffrast.torch as dr
 import trimesh
-from typing import Tuple, Optional, Union
-import cv2
+from typing import Tuple
 import logging
-
-# Handle CUDA context - use shared manager if available
-try:
-    from CUDAContext import CUDAContextManager
-    USE_SHARED_CONTEXT = True
-except ImportError:
-    USE_SHARED_CONTEXT = False
+from CUDAContext import CUDAContextManager
 
 class MeshRenderer:
     """
-    GPU-accelerated mesh renderer using nvdiffrast for FoundationPose.
+    GPU-accelerated mesh renderer using nvdiffrast.
 
-    This renderer generates synthetic RGB and depth images of objects
-    at specified poses for pose hypothesis generation and refinement.
+    This renderer is responsible for creating synthetic images from a 3D mesh
+    given a set of camera poses. It uses the nvdiffrast library for high-speed
+    rasterization on the GPU. This class is designed to integrate into a larger
+    pipeline where GPU resources must be shared with other libraries like
+    TensorRT.
 
-    UNITS:
-    - Input poses: meters (m)
-    - Input mesh vertices: meters (m)
-    - Output depth: meters (m)
-    - Camera intrinsics: pixels
-
-    Optimized for:
-    - Batch rendering of multiple poses
-    - 160x160 output for model input
-    - GPU memory efficiency
-    - Minimal CPU-GPU transfers
+    Key Features:
+    - Renders RGB and depth images from a trimesh object.
+    - Uses a shared CUDA context via CUDAContextManager to ensure compatibility.
+    - Transforms vertices and projects them to screen space for rendering.
+    - Supports batch rendering for efficient processing of many poses at once.
     """
 
     def __init__(self, mesh: trimesh.Trimesh, device: str = 'cuda'):
         """
-        Initialize renderer with a mesh.
+        Initializes the renderer with a given 3D mesh.
 
         Args:
-            mesh: Trimesh object with vertices in meters
-            device: PyTorch device ('cuda' or 'cpu')
+            mesh (trimesh.Trimesh): A trimesh object containing the model's vertices and faces.
+                                  Vertices are expected to be in meters.
+            device (str): The PyTorch device to use for rendering ('cuda').
         """
         self.device = torch.device(device)
         self.logger = logging.getLogger(__name__)
 
-        # Get CUDA context manager if available
-        self.cuda_mgr = None
-        if USE_SHARED_CONTEXT:
-            self.cuda_mgr = CUDAContextManager.get_instance()
-            # Initialize nvdiffrast context through manager
-            self.glctx = self.cuda_mgr.get_nvdiff_context()
-        else:
-            # Create own context
-            self.glctx = dr.RasterizeCudaContext(device=self.device)
+        # Obtain the singleton instance of the CUDA context manager
+        self.cuda_mgr = CUDAContextManager.get_instance()
+        # Get the shared nvdiffrast context from the manager
+        self.glctx = self.cuda_mgr.get_nvdiff_context()
 
-        # Load mesh to GPU
-        self.vertices = torch.from_numpy(
-            mesh.vertices.astype(np.float32)
-        ).to(self.device)
-
-        self.faces = torch.from_numpy(
-            mesh.faces.astype(np.int32)
-        ).to(self.device)
-
-        # Compute vertex colors from normals for shading
-        if hasattr(mesh, 'vertex_normals') and mesh.vertex_normals is not None:
-            # Simple Lambert shading
-            light_dir = np.array([0.0, 0.0, 1.0])  # Camera-aligned light
-            shading = np.clip(mesh.vertex_normals @ light_dir, 0.3, 1.0)
-            colors = np.stack([shading] * 3, axis=-1)
-        else:
-            colors = np.ones((len(mesh.vertices), 3)) * 0.7
-
-        self.vertex_colors = torch.from_numpy(
-            colors.astype(np.float32)
-        ).to(self.device)
-
-        # Cache mesh properties
-        self.n_vertices = len(mesh.vertices)
-        self.n_faces = len(mesh.faces)
-        self.mesh_center = mesh.vertices.mean(axis=0)
-        self.mesh_scale = np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
-
-        self.logger.info(f"Initialized renderer: {self.n_vertices} vertices, "
-                        f"{self.n_faces} faces, scale: {self.mesh_scale:.3f}m")
+        # Load mesh data onto the GPU
+        self.set_mesh(mesh)
 
     def render(self, pose: np.ndarray, K: np.ndarray,
-               width: int = 160, height: int = 160,
-               z_near: float = 0.01, z_far: float = 10.0) -> Tuple[np.ndarray, np.ndarray]:
+               width: int = 160, height: int = 160) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Render mesh at given pose.
-
-        Args:
-            pose: 4x4 pose matrix (object to camera) in meters
-            K: 3x3 camera intrinsic matrix (will be scaled if needed)
-            width: Output image width
-            height: Output image height
-            z_near: Near clipping plane (meters)
-            z_far: Far clipping plane (meters)
-
-        Returns:
-            Tuple of:
-            - rgb: (H, W, 3) uint8 RGB image
-            - depth: (H, W) float32 depth in meters
+        Render mesh at a single given pose. This is a convenience wrapper
+        for render_batch.
         """
-        # Single pose - add batch dimension
-        rgbs, depths = self.render_batch(
-            np.array([pose]), K, width, height, z_near, z_far
-        )
+        # Add a batch dimension to the single pose and call the batch renderer
+        rgbs, depths = self.render_batch(np.array([pose]), K, width, height)
         return rgbs[0], depths[0]
 
     def render_batch(self, poses: np.ndarray, K: np.ndarray,
-                    width: int = 160, height: int = 160,
-                    z_near: float = 0.01, z_far: float = 10.0) -> Tuple[np.ndarray, np.ndarray]:
+                    width: int = 160, height: int = 160) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Render mesh at multiple poses efficiently in batch.
+        Renders the mesh from a batch of different camera poses.
+
+        This is the primary rendering method, designed for efficiency. It wraps
+        the core rendering logic in the nvdiffrast activation context.
 
         Args:
-            poses: (N, 4, 4) pose matrices in meters
-            K: 3x3 camera intrinsic matrix
-            width: Output image width
-            height: Output image height
-            z_near: Near clipping plane (meters)
-            z_far: Far clipping plane (meters)
+            poses (np.ndarray): The poses of the object relative to the camera.
+                - Shape: (N, 4, 4), where N is the number of poses in the batch.
+                - Represents the object-to-camera transformation matrix.
+                - The rotation part (3x3) and translation vector (3x1) are in meters.
+            K (np.ndarray): The 3x3 camera intrinsic matrix.
+                - Defines the camera's focal length and principal point.
+                - Assumes a standard 640x480 resolution and is scaled internally.
+            width (int): The desired output image width.
+            height (int): The desired output image height.
 
         Returns:
-            Tuple of:
-            - rgbs: (N, H, W, 3) uint8 RGB images
-            - depths: (N, H, W) float32 depth in meters
+            A tuple containing:
+            - rgbs (np.ndarray): A batch of rendered RGB images.
+                - Shape: (N, H, W, 3), with H=height, W=width.
+                - Values are uint8, from 0 to 255.
+            - depths (np.ndarray): A batch of rendered depth maps.
+                - Shape: (N, H, W).
+                - Values are float32, representing the distance from the camera
+                  plane to the object surface in meters.
         """
-        # Wrap rendering in context if using shared manager
-        if self.cuda_mgr:
-            with self.cuda_mgr.activate_nvdiffrast():
-                return self._do_render_batch(poses, K, width, height, z_near, z_far)
-        else:
-            return self._do_render_batch(poses, K, width, height, z_near, z_far)
+        # Activate the nvdiffrast context for the duration of the rendering
+        with self.cuda_mgr.activate_nvdiffrast():
+            return self._do_render_batch(poses, K, width, height)
 
     def _do_render_batch(self, poses: np.ndarray, K: np.ndarray,
-                         width: int, height: int,
-                         z_near: float, z_far: float) -> Tuple[np.ndarray, np.ndarray]:
-        """Internal rendering logic."""
+                         width: int, height: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        The core rendering logic, executed within the correct CUDA context.
+        This function orchestrates the transformation, projection, and rasterization pipeline.
+        """
         batch_size = len(poses)
 
-        # Scale intrinsics if rendering at different resolution
-        # Assume original resolution is 640x480 (typical for LM-O)
+        # --- Data Transformation: Scale Camera Intrinsics ---
+        # The provided intrinsic matrix K is for a reference resolution (e.g., 640x480).
+        # We must scale it to match the target rendering resolution (width, height).
         K_scaled = K.copy()
-        scale_x = width / 640.0
-        scale_y = height / 480.0
-        K_scaled[0, 0] *= scale_x  # fx
-        K_scaled[0, 2] *= scale_x  # cx
-        K_scaled[1, 1] *= scale_y  # fy
-        K_scaled[1, 2] *= scale_y  # cy
-
-        # Convert to torch
-        poses_torch = torch.from_numpy(poses.astype(np.float32)).to(self.device)
+        K_scaled[0, 0] *= width / 640.0   # Scale fx
+        K_scaled[0, 2] *= width / 640.0   # Scale cx
+        K_scaled[1, 1] *= height / 480.0  # Scale fy
+        K_scaled[1, 2] *= height / 480.0  # Scale cy
         K_torch = torch.from_numpy(K_scaled.astype(np.float32)).to(self.device)
 
-        # Transform vertices by each pose
-        # vertices: (V, 3), poses: (N, 4, 4)
-        vertices_homo = torch.cat([
-            self.vertices,
-            torch.ones(self.n_vertices, 1, device=self.device)
-        ], dim=1)  # (V, 4)
+        poses_torch = torch.from_numpy(poses.astype(np.float32)).to(self.device)
 
-        # Batch transform: (N, 4, 4) @ (V, 4).T -> (N, 4, V) -> (N, V, 4)
-        transformed = torch.matmul(poses_torch, vertices_homo.T).transpose(1, 2)
-        vertices_cam = transformed[:, :, :3]  # (N, V, 3)
+        # --- Data Transformation: Vertex Transformation ---
+        # 1. Convert vertices to homogeneous coordinates by adding a 'w' component of 1.
+        #    This allows us to perform rotation and translation with a single matrix multiplication.
+        #    Shape: (num_vertices, 3) -> (num_vertices, 4)
+        vertices_homo = torch.cat([self.vertices, torch.ones(self.n_vertices, 1, device=self.device)], dim=1)
 
-        # Project to screen space
-        vertices_proj = self._project_points(vertices_cam, K_torch, width, height)
+        # 2. Apply the batch of pose transformations.
+        #    Coordinate System: The vertices are transformed from Object Space to Camera Space.
+        #    Matrix multiplication: (N, 4, 4) @ (V, 4).T -> (N, 4, V) -> (N, V, 4)
+        transformed_verts = torch.matmul(poses_torch, vertices_homo.T).transpose(1, 2)
 
-        # Prepare for rasterization - need (N*V, 4) format
-        vertices_clip = vertices_proj.reshape(-1, 4)
+        # 3. Discard the 'w' component to get 3D points in camera space.
+        #    Shape: (N, V, 3)
+        vertices_cam = transformed_verts[:, :, :3]
 
-        # Expand faces for batch
+        # --- Data Transformation: Projection ---
+        # Project the 3D points from Camera Space to Clip Space. Clip space is a
+        # normalized cube where x,y,z are typically in [-1, 1]. This is the format
+        # the rasterizer expects.
+        vertices_clip = self._project_points(vertices_cam, K_torch, width, height).reshape(-1, 4)
+
+        # --- Rasterization Setup ---
+        # The rasterizer needs a flat list of faces with vertex indices adjusted
+        # for the batch. Example: For batch item `i`, a vertex index `v` becomes `v + i * num_vertices`.
         faces_expanded = self.faces.unsqueeze(0).expand(batch_size, -1, -1)
-        face_offsets = (torch.arange(batch_size, device=self.device, dtype=torch.int32) * self.n_vertices).reshape(-1, 1, 1)
-        faces_batch = (faces_expanded + face_offsets).reshape(-1, 3).int()
+        face_offsets = torch.arange(batch_size, device=self.device, dtype=torch.int32) * self.n_vertices
+        faces_batch = (faces_expanded + face_offsets.view(-1, 1, 1)).reshape(-1, 3)
 
-        # Create ranges for batch rendering
+        # Define ranges for nvdiffrast to know which faces belong to which image in the batch.
         ranges = torch.stack([
             torch.arange(batch_size, dtype=torch.int32) * self.n_faces,
             torch.full((batch_size,), self.n_faces, dtype=torch.int32)
         ], dim=1).cpu()
 
-        # Rasterize
-        rast_out, _ = dr.rasterize(
-            self.glctx, vertices_clip, faces_batch,
-            resolution=[height, width], ranges=ranges
-        )
+        # --- GPU Rasterization & Interpolation ---
+        # 1. Rasterize the mesh to get pixel-to-face mappings and barycentric coordinates.
+        rast_out, _ = dr.rasterize(self.glctx, vertices_clip, faces_batch, resolution=[height, width], ranges=ranges)
 
-        # Reshape rasterization output
-        rast_out = rast_out.reshape(batch_size, height, width, 4)
+        # 2. Interpolate vertex attributes (color and depth) across the mesh surface for each pixel.
+        color_interpolated, _ = dr.interpolate(self.vertex_colors.unsqueeze(0).expand(batch_size, -1, -1).reshape(-1, 3), rast_out, faces_batch)
+        depth_interpolated, _ = dr.interpolate(vertices_cam[..., 2].reshape(-1, 1), rast_out, faces_batch)
 
-        # Create masks where mesh was rendered
-        masks = rast_out[..., 3] > 0
+        # --- Final Image Formation ---
+        # Create a mask of valid pixels (where the object was rendered).
+        mask = rast_out[..., 3] > 0
+        depth_interpolated = depth_interpolated[..., 0] * mask
 
-        # Prepare vertex attributes for interpolation
-        # Colors need to be repeated for each batch
-        colors_batch = self.vertex_colors.unsqueeze(0).expand(batch_size, -1, -1)
-        colors_flat = colors_batch.reshape(-1, 3)
-
-        # Depth values for interpolation
-        z_values = vertices_cam[..., 2].reshape(-1, 1)  # (N*V, 1)
-
-        # Interpolate colors
-        color_out, _ = dr.interpolate(
-            colors_flat, rast_out, faces_batch
-        )
-
-        # Interpolate depth
-        depth_out, _ = dr.interpolate(
-            z_values, rast_out, faces_batch
-        )
-        depth_out = depth_out[..., 0]
-
-        # Apply masks
-        rgbs_torch = color_out * masks.unsqueeze(-1)
-        depths_torch = depth_out * masks
-
-        # Convert to numpy
-        rgbs = (rgbs_torch * 255).clamp(0, 255).byte().cpu().numpy()
-        depths = depths_torch.cpu().numpy()
+        # Convert final images to numpy arrays for CPU use.
+        rgbs = (color_interpolated * 255).clamp(0, 255).byte().cpu().numpy()
+        depths = depth_interpolated.cpu().numpy()
 
         return rgbs, depths
 
     def _project_points(self, points_cam: torch.Tensor, K: torch.Tensor,
                        width: int, height: int) -> torch.Tensor:
         """
-        Project 3D points to normalized device coordinates.
+        Projects 3D points from camera space to 2D clip space required by nvdiffrast.
 
         Args:
-            points_cam: (N, V, 3) points in camera coordinates (meters)
-            K: 3x3 camera intrinsic matrix
-            width: Image width
-            height: Image height
+            points_cam (torch.Tensor): 3D points in the camera's coordinate system.
+                - Shape: (N, V, 3) where N is batch size, V is number of vertices.
+            K (torch.Tensor): The scaled 3x3 camera intrinsic matrix.
+            width (int), height (int): The dimensions of the output image.
 
         Returns:
-            (N, V, 4) points in clip space
+            torch.Tensor: Points in clip space.
+                - Shape: (N, V, 4), where the components are (x_ndc, y_ndc, z_cam, w=1).
         """
-        N, V, _ = points_cam.shape
+        # Project 3D points to 2D image plane using the intrinsic matrix K.
+        points_proj = torch.matmul(K.unsqueeze(0), points_cam.transpose(1, 2)).transpose(1, 2)
 
-        # Project to image plane
-        points_proj = torch.matmul(
-            K.unsqueeze(0), points_cam.transpose(1, 2)
-        ).transpose(1, 2)  # (N, V, 3)
-
-        # Normalize by z
+        # Perform perspective divide (normalize u,v by z) to get pixel coordinates.
         z = points_proj[..., 2:3].clamp(min=1e-5)
         uv = points_proj[..., :2] / z
 
-        # Convert to NDC (-1 to 1)
-        u_ndc = 2.0 * uv[..., 0] / width - 1.0
-        v_ndc = 1.0 - 2.0 * uv[..., 1] / height  # Flip Y
+        # Convert pixel coordinates to Normalized Device Coordinates (NDC) [-1, 1].
+        # The rasterizer expects this coordinate system.
+        u_ndc = (2.0 * uv[..., 0] / width - 1.0)
+        v_ndc = (1.0 - 2.0 * uv[..., 1] / height) # Y is flipped in NDC vs. image coordinates.
 
-        # For nvdiffrast, we need (x, y, z, w) in clip space
-        # z should be negative for visible points
-        return torch.stack([
-            u_ndc,
-            v_ndc,
-            -points_cam[..., 2],  # Negative z for nvdiffrast
-            torch.ones_like(u_ndc)
-        ], dim=-1)
+        # Return points in clip space (x, y, z, w). nvdiffrast uses z from camera space.
+        return torch.stack([u_ndc, v_ndc, -points_cam[..., 2], torch.ones_like(u_ndc)], dim=-1)
 
     def set_mesh(self, mesh: trimesh.Trimesh):
-        """Update the mesh for rendering."""
-        # Wrap mesh update in context if using shared manager
-        if self.cuda_mgr:
-            with self.cuda_mgr.activate_nvdiffrast():
-                self._do_set_mesh(mesh)
-        else:
-            self._do_set_mesh(mesh)
+        """
+        Updates the renderer with a new mesh, loading its data to the GPU.
+        """
+        self.vertices = torch.from_numpy(mesh.vertices.astype(np.float32)).to(self.device)
+        self.faces = torch.from_numpy(mesh.faces.astype(np.int32)).to(self.device)
+        self.n_vertices, self.n_faces = len(mesh.vertices), len(mesh.faces)
+        self.mesh_center = mesh.vertices.mean(axis=0)
 
-    def _do_set_mesh(self, mesh: trimesh.Trimesh):
-        """Internal mesh update logic."""
-        self.vertices = torch.from_numpy(
-            mesh.vertices.astype(np.float32)
-        ).to(self.device)
-
-        self.faces = torch.from_numpy(
-            mesh.faces.astype(np.int32)
-        ).to(self.device)
-
+        # Calculate simple shading based on vertex normals facing a camera-aligned light.
         if hasattr(mesh, 'vertex_normals') and mesh.vertex_normals is not None:
             light_dir = np.array([0.0, 0.0, 1.0])
             shading = np.clip(mesh.vertex_normals @ light_dir, 0.3, 1.0)
@@ -289,168 +208,65 @@ class MeshRenderer:
         else:
             colors = np.ones((len(mesh.vertices), 3)) * 0.7
 
-        self.vertex_colors = torch.from_numpy(
-            colors.astype(np.float32)
-        ).to(self.device)
+        self.vertex_colors = torch.from_numpy(colors.astype(np.float32)).to(self.device)
+        self.logger.info(f"Renderer mesh updated: {self.n_vertices} vertices, {self.n_faces} faces.")
 
-        self.n_vertices = len(mesh.vertices)
-        self.n_faces = len(mesh.faces)
-        self.mesh_center = mesh.vertices.mean(axis=0)
-        self.mesh_scale = np.linalg.norm(mesh.bounds[1] - mesh.bounds[0])
-
-
-# Unit tests
+# Standalone Unit Tests
 if __name__ == "__main__":
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
+    from pathlib import Path
+    import cv2
+    import time
     from DataLoader import DataLoader
 
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
     print("="*80)
-    print("Mesh Renderer Unit Tests")
+    print("MeshRenderer Standalone Test")
     print("="*80)
 
-    # Check if shared context is available
-    if USE_SHARED_CONTEXT:
-        print("Using shared CUDA context manager")
-    else:
-        print("Using standalone mode (no shared context)")
+    manager = None
+    try:
+        print("Initializing CUDA context...")
+        manager = CUDAContextManager.get_instance()
 
-    # Load test data
-    loader = DataLoader("./data")
+        print("Loading test data...")
+        loader = DataLoader("./data")
+        mesh = loader.load_object_model(1)
+        renderer = MeshRenderer(mesh)
 
-    # Test 1: Single pose rendering
-    print("\nTest 1: Single Pose Rendering")
+        print("\n[Test 1] Rendering a single pose...")
+        pose = np.eye(4); pose[2, 3] = 0.5
+        renderer.render(pose, loader.K)
+        print(" -> Single pose render successful.")
 
-    # Load a mesh
-    mesh = loader.load_object_model(1)
-    renderer = MeshRenderer(mesh)
+        print("\n[Test 2] Batch Rendering & Visualization...")
+        n_poses = 8
+        poses = np.array([np.eye(4) for _ in range(n_poses)], dtype=np.float32)
+        for i in range(n_poses):
+            angle = i * 2 * np.pi / n_poses
+            poses[i, :3, :3] = cv2.Rodrigues(np.array([0, angle, 0], dtype=np.float32))[0]
+            poses[i, 2, 3] = 0.4
 
-    # Debug info
-    print(f"Mesh bounds: {mesh.bounds}")
-    print(f"Mesh center: {mesh.vertices.mean(axis=0)}")
-    print(f"Camera K:\n{loader.K}")
+        rgbs, depths = renderer.render_batch(poses, loader.K)
 
-    # Create test pose (object at 0.5m from camera)
-    pose = np.eye(4, dtype=np.float32)
-    pose[2, 3] = 0.5  # 0.5 meters in Z
+        viz_dir = Path("viz"); viz_dir.mkdir(exist_ok=True)
+        fig, axes = plt.subplots(2, n_poses, figsize=(2 * n_poses, 4))
+        for i in range(n_poses):
+            axes[0, i].imshow(rgbs[i]); axes[0, i].axis('off')
+            axes[1, i].imshow(depths[i], cmap='viridis'); axes[1, i].axis('off')
+        save_path = viz_dir / 'meshrenderer_standalone_test.png'
+        plt.savefig(save_path, dpi=150)
+        print(f" -> Visualization saved to {save_path}")
 
-    # Add slight rotation to see the object better
-    pose[:3, :3] = cv2.Rodrigues(np.array([0.2, 0.3, 0], dtype=np.float32))[0]
-
-    # Render
-    rgb, depth = renderer.render(pose, loader.K, 160, 160)
-
-    print(f"RGB shape: {rgb.shape}, dtype: {rgb.dtype}")
-    print(f"Depth shape: {depth.shape}, dtype: {depth.dtype}")
-    print(f"Unique RGB values: {np.unique(rgb).shape[0]}")
-    if depth[depth > 0].size > 0:
-        print(f"Depth range: {depth[depth > 0].min():.3f} - {depth[depth > 0].max():.3f} m")
-        print(f"Number of valid depth pixels: {(depth > 0).sum()}")
-    else:
-        print("Object not visible in depth.")
-
-    # Test 2: Batch rendering
-    print("\nTest 2: Batch Rendering")
-
-    # Create multiple poses
-    n_poses = 8
-    poses = []
-    for i in range(n_poses):
-        angle = i * 2 * np.pi / n_poses
-        pose = np.eye(4, dtype=np.float32)
-        pose[:3, :3] = cv2.Rodrigues(np.array([0, angle, 0], dtype=np.float32))[0]
-        pose[2, 3] = 0.5
-        poses.append(pose)
-    poses = np.array(poses)
-
-    # Batch render
-    import time
-    t0 = time.time()
-    rgbs, depths = renderer.render_batch(poses, loader.K, 160, 160)
-    t_batch = time.time() - t0
-
-    print(f"Batch rendered {n_poses} poses in {t_batch:.3f}s ({n_poses/t_batch:.1f} fps)")
-    print(f"RGBs shape: {rgbs.shape}")
-    print(f"Depths shape: {depths.shape}")
-
-    # Test 3: Compare with ground truth
-    print("\nTest 3: Render at GT Pose")
-
-    # Load a frame with ground truth
-    scenes = loader.get_available_scenes()
-    if scenes:
-        data = loader.load_frame_data(scenes[0], 0)
-        if data['poses']:
-            gt_pose = data['poses'][0]
-            obj_id = data['object_ids'][0]
-
-            # Render at GT pose
-            mesh = loader.load_object_model(obj_id)
-            renderer.set_mesh(mesh)
-            rgb_synth, depth_synth = renderer.render(gt_pose, data['K'],
-                                                    loader.width, loader.height)
-
-            print(f"Rendered object {obj_id} at GT pose")
-            print(f"GT pose translation: {gt_pose[:3, 3]}")
-            if data['depth'][data['depth'] > 0].size > 0:
-                print(f"Real depth range: {data['depth'][data['depth'] > 0].min():.3f} - "
-                      f"{data['depth'][data['depth'] > 0].max():.3f} m")
-            if depth_synth[depth_synth > 0].size > 0:
-                print(f"Synth depth range: {depth_synth[depth_synth > 0].min():.3f} - "
-                      f"{depth_synth[depth_synth > 0].max():.3f} m")
-
-    # Test 4: Mesh switching
-    print("\nTest 4: Mesh Switching")
-    if len(loader.object_ids) > 1:
-        mesh2 = loader.load_object_model(loader.object_ids[1])
-        renderer.set_mesh(mesh2)
-        rgb2, depth2 = renderer.render(pose, loader.K, 160, 160)
-        print(f"Switched to object {loader.object_ids[1]}")
-        print(f"New mesh scale: {renderer.mesh_scale:.3f}m")
-
-    # Visualize results
-    fig, axes = plt.subplots(3, n_poses, figsize=(2*n_poses, 6))
-
-    for i in range(n_poses):
-        # RGB
-        axes[0, i].imshow(rgbs[i])
-        axes[0, i].axis('off')
-        if i == 0:
-            axes[0, i].set_ylabel('RGB', fontsize=12)
-
-        # Depth
-        depth_vis = depths[i].copy()
-        if depth_vis[depth_vis > 0].size > 0:
-            vmin = depth_vis[depth_vis > 0].min()
-            vmax = depth_vis[depth_vis > 0].max()
-            depth_vis[depth_vis == 0] = np.nan
-            axes[1, i].imshow(depth_vis, cmap='viridis', vmin=vmin, vmax=vmax)
-        else:
-            axes[1, i].imshow(depth_vis, cmap='viridis')
-        axes[1, i].axis('off')
-        if i == 0:
-            axes[1, i].set_ylabel('Depth', fontsize=12)
-
-        # Mask
-        mask = depths[i] > 0
-        axes[2, i].imshow(mask, cmap='gray')
-        axes[2, i].axis('off')
-        if i == 0:
-            axes[2, i].set_ylabel('Mask', fontsize=12)
-
-    plt.suptitle('Batch Rendering Results - Object Rotated 360°')
-    plt.tight_layout()
-
-    # Save
-    from pathlib import Path
-    viz_dir = Path("viz")
-    viz_dir.mkdir(exist_ok=True)
-    plt.savefig(viz_dir / 'meshrenderer_test.png', dpi=150, bbox_inches='tight')
-    print(f"\nVisualization saved to: {viz_dir / 'meshrenderer_test.png'}")
-
-    print("\n" + "="*80)
-    print("All tests passed!")
-    print("="*80)
+        print("\n" + "="*80)
+        print("All tests passed!")
+        print("="*80)
+    except Exception as e:
+        logging.error(f"A test failed: {e}", exc_info=True)
+    finally:
+        if manager:
+            print("\nCleaning up CUDA context...")
+            manager.cleanup()
