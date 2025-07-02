@@ -282,7 +282,7 @@ if __name__ == "__main__":
             cropped_real['rgb'], cropped_real['depth'],
             rgbddd_real_unnormalized[:, :, 3:], rgbddd_real_normalized[:, :, 3:],
             title="Real Data Processing Pipeline",
-            filename="depth_processor_real_data.png"
+            filename="depth_processor_real_test.png"
         )
 
         # --- Pipeline 2: Synthetic Data ---
@@ -307,7 +307,7 @@ if __name__ == "__main__":
             cropped_synth['rgb'], cropped_synth['depth'],
             rgbddd_synth_unnormalized[:, :, 3:], rgbddd_synth_normalized[:, :, 3:],
             title="Synthetic Data Processing Pipeline",
-            filename="depth_processor_synthetic_data.png"
+            filename="depth_processor_synthetic_test.png"
         )
 
     except Exception as e:

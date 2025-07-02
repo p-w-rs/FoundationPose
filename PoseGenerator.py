@@ -246,162 +246,77 @@ if __name__ == "__main__":
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    from mpl_toolkits.mplot3d import Axes3D
+    from pathlib import Path
+    import cv2
     from DataLoader import DataLoader
     from MeshRenderer import MeshRenderer
+    from CUDAContext import CUDAContextManager
 
     logging.basicConfig(level=logging.INFO)
 
-    print("="*80)
-    print("Pose Generator Unit Tests")
-    print("="*80)
+    manager = None
+    try:
+        print("="*80)
+        print("Pose Generator Unit Tests")
+        print("="*80)
 
-    # Load test mesh
-    loader = DataLoader("./data")
-    mesh = loader.load_object_model(1)
+        print("Initializing CUDA, loading data, and setting up renderer...")
+        manager = CUDAContextManager.get_instance()
+        loader = DataLoader("./data")
+        mesh = loader.load_object_model(1)
+        renderer = MeshRenderer(mesh)
+        generator = PoseGenerator(mesh)
 
-    # Test 1: Icosphere generation
-    print("\nTest 1: Icosphere Viewpoints")
-    generator = PoseGenerator(mesh)
-    print(f"Generated {generator.n_viewpoints} viewpoints")
-    print(f"Object center: {generator.mesh_center}")
-    print(f"Object radius: {generator.mesh_radius:.3f}m")
+        print("\n[Test] Generating and rendering poses...")
+        poses = generator.generate_poses(n_poses=8, distance_factor=3.0)
+        rgbs, depths = renderer.render_batch(poses, loader.K, width=160, height=160)
+        print(f" -> Generated and rendered {len(poses)} poses.")
 
-    # Test 2: Pose generation
-    print("\nTest 2: Pose Generation")
-    poses = generator.generate_poses(n_poses=20)
-    print(f"Generated {len(poses)} poses")
+        # --- Create Visualization ---
+        fig, axes = plt.subplots(3, len(poses), figsize=(2.5 * len(poses), 8))
+        fig.suptitle("PoseGenerator Output Verification (Rendered at 160x160)", fontsize=16)
 
-    # Analyze pose distribution
-    translations = np.array([pose[:3, 3] for pose in poses])
-    distances = np.linalg.norm(translations - generator.mesh_center, axis=1)
-    print(f"Distance range: {distances.min():.3f} - {distances.max():.3f}m")
-    print(f"Mean distance: {distances.mean():.3f}m")
+        all_depths = np.stack(depths)
+        valid_depths = all_depths[all_depths > 0]
+        vmin, vmax = (valid_depths.min(), valid_depths.max()) if valid_depths.size > 0 else (0,1)
 
-    # Test 3: Render poses at 160x160
-    print("\nTest 3: Rendering from Generated Poses at 160x160")
-    renderer = MeshRenderer(mesh)
+        for i in range(len(poses)):
+            axes[0, i].imshow(rgbs[i])
+            axes[0, i].set_title(f'Pose {i}')
+            axes[0, i].axis('off')
 
-    # Render subset of poses at model input size
-    n_render = min(12, len(poses))
-    rgbs = []
-    depths = []
-    masks = []
-
-    for i in range(n_render):
-        rgb, depth = renderer.render(poses[i], loader.K, 160, 160)
-        mask = (depth > 0).astype(np.uint8) * 255
-        rgbs.append(rgb)
-        depths.append(depth)
-        masks.append(mask)
-
-    print(f"Rendered {n_render} poses at 160x160")
-    print(f"RGB shape: {rgbs[0].shape}")
-    print(f"Depth shape: {depths[0].shape}")
-    print(f"Mask shape: {masks[0].shape}")
-
-    # Test 4: Nearby pose generation
-    print("\nTest 4: Nearby Pose Generation")
-    ref_pose = poses[0]
-    nearby_poses = generator.generate_nearby_poses(ref_pose, n_poses=5)
-    print(f"Generated {len(nearby_poses)} nearby poses")
-
-    # Measure deviations
-    ref_t = ref_pose[:3, 3]
-    nearby_t = np.array([p[:3, 3] for p in nearby_poses])
-    deviations = np.linalg.norm(nearby_t - ref_t, axis=1)
-    print(f"Translation deviations: {deviations.mean():.3f} ± {deviations.std():.3f}m")
-
-    # Visualize
-    fig = plt.figure(figsize=(20, 12))
-
-    # 3D viewpoint visualization
-    ax1 = fig.add_subplot(2, 4, 1, projection='3d')
-    ax1.scatter(generator.viewpoints[:, 0],
-               generator.viewpoints[:, 1],
-               generator.viewpoints[:, 2],
-               c='b', s=20)
-    ax1.set_title('Icosphere Viewpoints')
-    ax1.set_xlabel('X')
-    ax1.set_ylabel('Y')
-    ax1.set_zlabel('Z')
-    ax1.set_box_aspect([1,1,1])
-
-    # Pose distribution
-    ax2 = fig.add_subplot(2, 4, 2, projection='3d')
-    cam_positions = translations + generator.mesh_center
-    ax2.scatter(cam_positions[:, 0],
-               cam_positions[:, 1],
-               cam_positions[:, 2],
-               c='r', s=50, alpha=0.6)
-    ax2.scatter(*generator.mesh_center, c='g', s=100, marker='*')
-    ax2.set_title('Camera Positions')
-    ax2.set_xlabel('X (m)')
-    ax2.set_ylabel('Y (m)')
-    ax2.set_zlabel('Z (m)')
-
-    # Empty space for layout
-    ax3 = fig.add_subplot(2, 4, 3)
-    ax3.axis('off')
-    ax4 = fig.add_subplot(2, 4, 4)
-    ax4.axis('off')
-
-    # Show RGB/Depth/Mask grid
-    n_cols = 4
-    n_rows = 3  # RGB, Depth, Mask
-
-    fig2 = plt.figure(figsize=(16, 12))
-    fig2.suptitle('160x160 Model Input Examples (RGB / Depth / Mask)', fontsize=16)
-
-    for i in range(min(n_cols, n_render)):
-        # RGB
-        ax = fig2.add_subplot(n_rows, n_cols, i + 1)
-        ax.imshow(rgbs[i])
-        if i == 0:
-            ax.set_ylabel('RGB', fontsize=12)
-        ax.set_title(f'Pose {i}')
-        ax.axis('off')
-
-        # Depth
-        ax = fig2.add_subplot(n_rows, n_cols, n_cols + i + 1)
-        depth_vis = depths[i].copy()
-        if depth_vis[depth_vis > 0].size > 0:
-            vmin = depth_vis[depth_vis > 0].min()
-            vmax = depth_vis[depth_vis > 0].max()
+            depth_vis = depths[i].copy()
             depth_vis[depth_vis == 0] = np.nan
-            im = ax.imshow(depth_vis, cmap='viridis', vmin=vmin, vmax=vmax)
-            # Add colorbar
-            cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            cbar.set_label('m', rotation=0, labelpad=5)
-        else:
-            ax.imshow(depth_vis, cmap='viridis')
-        if i == 0:
-            ax.set_ylabel('Depth', fontsize=12)
-        ax.axis('off')
+            im = axes[1, i].imshow(depth_vis, cmap='viridis', vmin=vmin, vmax=vmax)
+            axes[1, i].axis('off')
 
-        # Mask
-        ax = fig2.add_subplot(n_rows, n_cols, 2*n_cols + i + 1)
-        ax.imshow(masks[i], cmap='gray', vmin=0, vmax=255)
-        if i == 0:
-            ax.set_ylabel('Mask', fontsize=12)
-        ax.axis('off')
+            axes[2, i].imshow(depths[i] > 0, cmap='gray')
+            axes[2, i].axis('off')
 
-    plt.figure(fig.number)
-    plt.tight_layout()
+        axes[0, 0].set_ylabel("RGB", fontsize=14, labelpad=10)
+        axes[1, 0].set_ylabel("Depth", fontsize=14, labelpad=10)
+        axes[2, 0].set_ylabel("Mask", fontsize=14, labelpad=10)
 
-    plt.figure(fig2.number)
-    plt.tight_layout()
+        # Use fig.tight_layout() with a rect to make space for the colorbar and title
+        fig.tight_layout(rect=[0, 0.1, 1, 0.93])
 
-    # Save both figures
-    from pathlib import Path
-    viz_dir = Path("viz")
-    viz_dir.mkdir(exist_ok=True)
-    fig.savefig(viz_dir / 'posegenerator_test.png', dpi=150, bbox_inches='tight')
-    fig2.savefig(viz_dir / 'posegenerator_160x160_samples.png', dpi=150, bbox_inches='tight')
-    print(f"\nVisualizations saved to:")
-    print(f"  {viz_dir / 'posegenerator_test.png'}")
-    print(f"  {viz_dir / 'posegenerator_160x160_samples.png'}")
+        # Add the colorbar *after* tight_layout has made space for it
+        cbar_ax = fig.add_axes([0.2, 0.05, 0.6, 0.03]) # [left, bottom, width, height]
+        fig.colorbar(im, cax=cbar_ax, orientation='horizontal', label='Depth (meters)')
 
-    print("\n" + "="*80)
-    print("All tests passed!")
-    print("="*80)
+        viz_dir = Path("viz")
+        viz_dir.mkdir(exist_ok=True)
+        save_path = viz_dir / 'posegenerator_test.png'
+        plt.savefig(save_path, dpi=150)
+        print(f" -> Visualization saved to {save_path}")
+
+        print("\n" + "="*80)
+        print("All tests passed!")
+        print("="*80)
+
+    except Exception as e:
+        logging.error(f"A test failed: {e}", exc_info=True)
+    finally:
+        if manager:
+            print("\nCleaning up CUDA context...")
+            manager.cleanup()
