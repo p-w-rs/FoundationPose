@@ -1,14 +1,11 @@
 # Main.py
 
 import numpy as np
-import time
 import logging
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-import cv2
 from tqdm import tqdm
+import matplotlib.pyplot as plt
 
-# Import our custom modules
 from DataLoader import DataLoader
 from PoseGenerator import PoseGenerator
 from MeshRenderer import MeshRenderer
@@ -17,128 +14,104 @@ from DepthProcessor import DepthProcessor
 from ModelInterface import ModelInterface
 from CUDAContext import CUDAContextManager
 
+def pose_to_rgbddd(poses, loader, renderer, cropper, depther):
+    """
+    Takes a batch of poses, renders them, and processes them into RGBDDD format.
+    """
+    rgbddds = []
+    for pose in tqdm(poses, desc="Rendering Poses", leave=False):
+        rgb, depth = renderer.render(pose, loader.K, 640, 480)
+        mask = depth > 0
+        cropped = cropper.apply_crop(rgb, depth, mask, loader.K)
+        rgbddd = depther.process_rgbd_to_rgbddd(cropped['rgb'], cropped['depth'], cropped['K'])
+        rgbddds.append(rgbddd)
+    return np.array(rgbddds, dtype=np.float32)
+
+def visualize_iteration(iteration, real_rgbddd, synth_rgbddd_top, scores_top, save_dir="viz"):
+    """
+    Saves a visualization of the top 8 poses for a given iteration.
+    """
+    save_dir = Path(save_dir)
+    save_dir.mkdir(exist_ok=True)
+    n_poses = len(synth_rgbddd_top)
+    fig, axes = plt.subplots(2, n_poses + 1, figsize=((n_poses + 1) * 2.5, 6))
+    fig.suptitle(f"Iteration {iteration} | Best Score: {np.max(scores_top):.2f}", fontsize=16)
+
+    axes[0, 0].imshow(real_rgbddd[0, :, :, :3]); axes[0, 0].set_title("Real RGB"); axes[0, 0].axis('off')
+    all_depths = np.concatenate([real_rgbddd[..., 5:6], synth_rgbddd_top[..., 5:6]], axis=0)
+    valid_depths = all_depths[all_depths > 0]; vmin, vmax = (valid_depths.min(), valid_depths.max()) if valid_depths.size > 0 else (0, 1)
+    axes[1, 0].imshow(real_rgbddd[0, :, :, 5], cmap='viridis', vmin=vmin, vmax=vmax); axes[1, 0].set_title("Real Depth"); axes[1, 0].axis('off')
+
+    for i in range(n_poses):
+        axes[0, i + 1].imshow(synth_rgbddd_top[i, :, :, :3]); axes[0, i + 1].set_title(f"Score: {scores_top[i]:.2f}"); axes[0, i + 1].axis('off')
+        axes[1, i + 1].imshow(synth_rgbddd_top[i, :, :, 5], cmap='viridis', vmin=vmin, vmax=vmax); axes[1, i + 1].axis('off')
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95]); plt.savefig(save_dir / f"iteration_{iteration:02d}.png"); plt.close(fig)
+
 def run_tracking_pipeline():
     """
-    This function orchestrates the entire FoundationPose tracking pipeline.
-
-    It initializes all necessary components, loads the data, and then loops
-    through scenes and frames to perform pose estimation and tracking.
+    Orchestrates the full FoundationPose pipeline with a correct iterative
+    refinement loop, including pruning and jittering.
     """
-    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-    # --- 1. Initialization ---
-    # Initialize all the helper classes. When ModelInterface is created, it
-    # will automatically get the singleton instance of the CUDAContextManager,
-    # initializing the shared CUDA context for the entire application.
+    N_ITERATIONS = 5
+    N_POSES_TOTAL = 252
+    TOP_K = 32
+    N_JITTERED = N_POSES_TOTAL - TOP_K
+
     loader = DataLoader("./data")
-    crop_proc = CropProcessor()
-    depth_proc = DepthProcessor()
-
-    # The ModelInterface handles the TensorRT-based neural networks.
-    interface = ModelInterface(max_batch_size=252, opt_batch_size=64, use_fp16=True)
+    cropper = CropProcessor()
+    depther = DepthProcessor()
+    interface = ModelInterface(max_batch_size=N_POSES_TOTAL)
     interface.load_models()
-    interface.warmup() # Warm up the models to prevent a delay on the first frame.
+    interface.warmup()
+    mesh = loader.load_object_model(5)
+    generator = PoseGenerator(mesh)
+    renderer = MeshRenderer(mesh)
 
-    # --- 2. Main Processing Loop ---
-    # Loop through each object and scene defined in the dataset.
-    scenes = loader.get_available_scenes()
-    for obj_id in loader.object_ids[:2]:  # Using the first two objects for this example
-        try:
-            mesh = loader.load_object_model(obj_id)
-        except FileNotFoundError:
-            print(f"Object model for ID {obj_id} not found, skipping.")
-            continue
+    scene_id = loader.get_available_scenes()[0]
+    frame_id = loader.get_scene_frames(scene_id)[0]
+    frame = loader.load_frame_data(scene_id, frame_id)
 
-        # The MeshRenderer is tied to a specific object mesh.
-        renderer = MeshRenderer(mesh)
-        # The PoseGenerator creates initial pose hypotheses around the object.
-        generator = PoseGenerator(mesh)
+    cropped_real = cropper.apply_crop(frame['rgb'], frame['depth'], frame['masks'][1], frame['K'])
+    real_rgbddd = depther.process_rgbd_to_rgbddd(cropped_real['rgb'], cropped_real['depth'], cropped_real['K'])
 
-        # For the first frame, we generate a large number of poses to find the object.
-        # These are generated once per object.
-        initial_poses = generator.generate_poses()
+    poses = generator.generate_poses(n_poses=N_POSES_TOTAL)
 
-        # Pre-render synthetic views for each of these initial poses. This is a one-time
-        # cost per object, saving time during the tracking loop.
-        syn_rgbddd = []
-        print(f"Pre-rendering {len(initial_poses)} synthetic views for object {obj_id}...")
-        for pose in tqdm(initial_poses):
-            # Render a 160x160 image of the object at the given pose.
-            rgb, depth = renderer.render(pose, loader.K, 160, 160)
+    for i in range(N_ITERATIONS + 1):
+        synth_rgbddd = pose_to_rgbddd(poses, loader, renderer, cropper, depther)
+        real_rgbddd_batch = np.repeat(real_rgbddd[np.newaxis], len(poses), axis=0)
 
-            # The intrinsic matrix needs to be scaled for the 160x160 crop.
-            K_160 = loader.K.copy()
-            K_160[0, 0] *= 160/640; K_160[0, 2] *= 160/640
-            K_160[1, 1] *= 160/480; K_160[1, 2] *= 160/480
+        scores = interface.score_poses_batch(real_rgbddd_batch, synth_rgbddd)
 
-            # Process the rendered RGB and Depth into the 6-channel RGBDDD format
-            # that the neural network expects.
-            rgbddd = depth_proc.process_rgbd_to_rgbddd(rgb, depth, K_160)
-            syn_rgbddd.append(rgbddd)
+        top_8_indices = np.argsort(scores)[-8:]
+        visualize_iteration(i, real_rgbddd_batch, synth_rgbddd[top_8_indices], scores[top_8_indices])
+        logging.info(f"Iteration {i}: Best score = {np.max(scores):.4f}")
 
-        # Convert the list of images into a single numpy array for batch processing.
-        syn_rgbddd_batch = np.array(syn_rgbddd, dtype=np.float32)
+        if i == N_ITERATIONS:
+            break
 
-        # Now, process a scene frame by frame.
-        scene_id = scenes[0]  # Using the first scene for this example
-        frames = loader.get_scene_frames(scene_id)
-        print(f"\nProcessing scene {scene_id} for object {obj_id} ({len(frames)} frames total)...")
+        top_k_indices = np.argsort(scores)[-TOP_K:]
 
-        for frame_id in frames[:2]: # Using the first two frames for this example
-            print(f"--- Frame {frame_id} ---")
+        refined_poses = interface.refine_poses_batch(
+            poses[top_k_indices],
+            real_rgbddd_batch[top_k_indices],
+            synth_rgbddd[top_k_indices]
+        )
 
-            # --- 3. Per-Frame Processing ---
-            frame_data = loader.load_frame_data(scene_id, frame_id)
+        best_refined_pose = refined_poses[-1]
+        jittered_poses = generator.generate_nearby_poses(best_refined_pose, n_poses=N_JITTERED)
 
-            # Crop the real image around the object using its segmentation mask.
-            cropped_frame = crop_proc.apply_crop(
-                frame_data['rgb'], frame_data['depth'], frame_data['masks'][0], frame_data['K']
-            )
-
-            # Process the cropped real view into the 6-channel RGBDDD format.
-            real_rgbddd = depth_proc.process_rgbd_to_rgbddd(
-                cropped_frame['rgb'], cropped_frame['depth'], cropped_frame['K']
-            ).astype(np.float32)
-
-            # Duplicate the single real view to match the batch size of our pose hypotheses.
-            real_rgbddd_batch = np.repeat(real_rgbddd[np.newaxis], len(initial_poses), axis=0)
-
-            # --- 4. Pose Refinement ---
-            # This is the core step: the model interface takes the initial poses, the real
-            # image, and the corresponding synthetic images, and predicts the refined poses.
-            print("Refining poses...")
-            refined_poses = interface.refine_poses_batch(
-                initial_poses.copy(), real_rgbddd_batch, syn_rgbddd_batch
-            )
-
-            # In a full implementation, you would now score these refined_poses,
-            # select the best one, and use it as the starting point for the next frame.
-            print(f"Successfully processed frame {frame_id}. Best pose would be selected here.")
-
+        poses = np.vstack([refined_poses, jittered_poses])
 
 if __name__ == "__main__":
-    """
-    The main entry point of the application.
-
-    This block ensures that the application runs and, critically, that all
-    CUDA resources are properly released upon exit, preventing errors.
-    """
     manager = None
     try:
-        # Run the main tracking pipeline.
         run_tracking_pipeline()
     except Exception as e:
-        # Log any critical errors that occur during the pipeline.
         logging.error(f"A critical error occurred in the main pipeline: {e}", exc_info=True)
     finally:
-        # This block is guaranteed to run, even if errors occur.
-        # We must explicitly clean up the CUDA context to prevent resource leaks
-        # and shutdown errors.
-        try:
-            # Get the singleton instance of the manager and clean it up.
-            manager = CUDAContextManager.get_instance()
-            if manager:
-                print("\nCleaning up CUDA context...")
-                manager.cleanup()
-        except Exception as e:
-            logging.error(f"Failed to clean up CUDA context: {e}")
+        if (manager := CUDAContextManager.get_instance()) is not None:
+            logging.info("Cleaning up CUDA context...")
+            manager.cleanup()

@@ -88,7 +88,7 @@ class MeshRenderer:
         return rgbs, depths
 
     def _project_points(self, points_cam: torch.Tensor, K: torch.Tensor,
-                       width: int, height: int) -> torch.Tensor:
+                    width: int, height: int) -> torch.Tensor:
         """
         Projects 3D points from camera space to 2D clip space.
         """
@@ -97,11 +97,10 @@ class MeshRenderer:
         z = points_proj[..., 2:3].clamp(min=1e-5)
         uv = points_proj[..., :2] / z
 
+        # The Y-axis for NDC should be flipped
         u_ndc = (2.0 * uv[..., 0] / width - 1.0)
-        v_ndc = (1.0 - 2.0 * uv[..., 1] / height)
+        v_ndc = -(2.0 * uv[..., 1] / height - 1.0) # <-- FLIPPED THIS LINE
 
-        # *** THE FIX IS HERE: Use positive Z for clip space ***
-        # The rasterizer expects Z to increase with distance from the camera.
         return torch.stack([u_ndc, v_ndc, points_cam[..., 2], torch.ones_like(u_ndc)], dim=-1)
 
     def set_mesh(self, mesh: trimesh.Trimesh):
@@ -143,7 +142,7 @@ if __name__ == "__main__":
         print("Initializing CUDA context and loading data...")
         manager = CUDAContextManager.get_instance()
         loader = DataLoader("./data")
-        mesh = loader.load_object_model(1)
+        mesh = loader.load_object_model(5)
         renderer = MeshRenderer(mesh)
 
         print("\n[Test] Batch Rendering & Visualization...")

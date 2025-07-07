@@ -247,47 +247,6 @@ if __name__ == "__main__":
 
     # Set up logging
     logging.basicConfig(level=logging.INFO)
-
-    # Initialize loader
-    # Create dummy data directory for demonstration if it doesn't exist
-    data_path = Path("data")
-    if not data_path.exists():
-        print("Creating dummy data structure for demonstration.")
-        # Create all necessary dummy files and directories
-        (data_path / "lmo").mkdir(parents=True, exist_ok=True)
-        with open(data_path / "lmo" / "camera.json", "w") as f:
-            json.dump({
-                "fx": 572.4114, "fy": 573.57043, "cx": 325.2611, "cy": 242.04899,
-                "width": 640, "height": 480, "depth_scale": 1.0
-            }, f)
-
-        (data_path / "lmo_models" / "models").mkdir(parents=True, exist_ok=True)
-        # Create a dummy cube PLY file for object 1
-        dummy_mesh = trimesh.creation.box(bounds=[[-50,-50,-50],[50,50,50]])
-        dummy_mesh.export(data_path / "lmo_models" / "models" / "obj_000001.ply")
-
-
-        (data_path / "test" / "000002" / "rgb").mkdir(parents=True, exist_ok=True)
-        (data_path / "test" / "000002" / "depth").mkdir(exist_ok=True)
-        (data_path / "test" / "000002" / "mask_visib").mkdir(exist_ok=True)
-        # Create dummy images and gt files
-        dummy_rgb = np.random.randint(0, 256, (480, 640, 3), dtype=np.uint8)
-        dummy_depth = np.random.randint(400, 1500, (480, 640), dtype=np.uint16)
-        dummy_mask = np.zeros((480, 640), dtype=np.uint8)
-        dummy_mask[200:300, 300:400] = 255
-        cv2.imwrite(str(data_path / "test" / "000002" / "rgb" / "000000.png"), dummy_rgb)
-        cv2.imwrite(str(data_path / "test" / "000002" / "depth" / "000000.png"), dummy_depth)
-        cv2.imwrite(str(data_path / "test" / "000002" / "mask_visib" / "000000_000000.png"), dummy_mask)
-        with open(data_path / "test" / "000002" / "scene_gt.json", "w") as f:
-            json.dump({
-                "0": [{
-                    "cam_R_m2c": np.eye(3).flatten().tolist(),
-                    "cam_t_m2c": [0, 0, 1000], # 1m away
-                    "obj_id": 1
-                }]
-            }, f)
-
-
     loader = DataLoader("./data")
 
 

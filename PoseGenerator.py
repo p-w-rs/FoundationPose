@@ -263,7 +263,7 @@ if __name__ == "__main__":
         print("Initializing CUDA, loading data, and setting up renderer...")
         manager = CUDAContextManager.get_instance()
         loader = DataLoader("./data")
-        mesh = loader.load_object_model(1)
+        mesh = loader.load_object_model(5)
         renderer = MeshRenderer(mesh)
         generator = PoseGenerator(mesh)
 

@@ -1,323 +1,132 @@
+# DepthProcessor.py
+
 import numpy as np
-from typing import Tuple, Optional
+from typing import Tuple
 import logging
+from pathlib import Path
 
 class DepthProcessor:
     """
-    Convert RGB and depth images to RGBDDD format for FoundationPose models.
-
-    Takes 160x160 RGB/depth from either:
-    - Synthetic: PoseGenerator + MeshRenderer
-    - Real: CropProcessor
-
-    Outputs 6-channel RGBDDD:
-    - Channels 0-2: RGB normalized to [0, 1]
-    - Channels 3-5: XYZ point cloud in meters
-
-    UNITS:
-    - Input depth: meters (m)
-    - Output XYZ: meters (m)
-    - Camera intrinsics: pixels
+    Converts cropped RGB and depth images into the 6-channel RGBDDD format
+    required by the FoundationPose models.
     """
 
     def __init__(self):
-        """Initialize depth processor."""
+        """Initializes the depth processor."""
         self.logger = logging.getLogger(__name__)
 
     def depth_to_xyz(self, depth: np.ndarray, K: np.ndarray) -> np.ndarray:
         """
-        Convert depth map to XYZ point cloud.
-
-        Args:
-            depth: (H, W) depth map in meters
-            K: 3x3 camera intrinsic matrix
-
-        Returns:
-            (H, W, 3) XYZ point cloud in meters
+        Converts a depth map into a 3D point cloud (XYZ coordinates).
         """
         h, w = depth.shape
+        u, v = np.meshgrid(np.arange(w), np.arange(h))
+        fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+        Z = depth
+        X = (u - cx) * Z / fx
+        Y = (v - cy) * Z / fy
+        return np.stack([X, Y, Z], axis=-1)
 
-        # Create pixel grid
-        xx, yy = np.meshgrid(np.arange(w), np.arange(h))
-
-        # Unproject to 3D
-        fx, fy = K[0, 0], K[1, 1]
-        cx, cy = K[0, 2], K[1, 2]
-
-        z = depth
-        x = (xx - cx) * z / fx
-        y = (yy - cy) * z / fy
-
-        # Stack into XYZ
-        xyz = np.stack([x, y, z], axis=-1)
-
-        return xyz
-
-    def process_rgbd_to_rgbddd(self, rgb: np.ndarray, depth: np.ndarray,
-                              K: np.ndarray, normalize_xyz: bool = True) -> np.ndarray:
+    def process_rgbd_to_rgbddd(self, rgb: np.ndarray, depth: np.ndarray, K: np.ndarray) -> np.ndarray:
         """
-        Convert RGB-D to RGBDDD format for model input.
-
-        Args:
-            rgb: (H, W, 3) RGB image, uint8 [0-255]
-            depth: (H, W) depth map in meters
-            K: 3x3 camera intrinsic matrix
-            normalize_xyz: Whether to normalize XYZ coordinates
-
-        Returns:
-            (H, W, 6) RGBDDD array:
-            - [:,:,0:3]: RGB normalized to [0, 1]
-            - [:,:,3:6]: XYZ in meters (normalized if requested)
+        Converts a single RGB-D pair to the 6-channel RGBDDD format for model input.
         """
-        # Normalize RGB to [0, 1]
         rgb_norm = rgb.astype(np.float32) / 255.0
-
-        # Convert depth to XYZ
         xyz = self.depth_to_xyz(depth, K)
-
-        # Normalize XYZ if requested
-        if normalize_xyz:
-            # Normalize based on typical object distances (0.3-1.0m)
-            # This helps model convergence
-            xyz_norm = xyz.copy()
-            mask = depth > 0
-            if np.any(mask):
-                # Center around mean depth
-                mean_z = depth[mask].mean()
-                xyz_norm[..., 2] = (xyz_norm[..., 2] - mean_z) / mean_z
-                # Scale X,Y by same factor
-                xyz_norm[..., 0] = xyz_norm[..., 0] / mean_z
-                xyz_norm[..., 1] = xyz_norm[..., 1] / mean_z
-            xyz = xyz_norm
-
-        # Stack RGBDDD
-        rgbddd = np.concatenate([rgb_norm, xyz], axis=-1).astype(np.float32)
-
-        return rgbddd
-
-    def batch_process(self, rgbs: np.ndarray, depths: np.ndarray,
-                     Ks: np.ndarray, normalize_xyz: bool = True) -> np.ndarray:
-        """
-        Process batch of RGB-D pairs.
-
-        Args:
-            rgbs: (N, H, W, 3) RGB images
-            depths: (N, H, W) depth maps in meters
-            Ks: (N, 3, 3) or (3, 3) camera intrinsics
-            normalize_xyz: Whether to normalize XYZ
-
-        Returns:
-            (N, H, W, 6) batch of RGBDDD
-        """
-        batch_size = len(rgbs)
-        h, w = rgbs.shape[1:3]
-
-        # Handle single K for all images
-        if Ks.ndim == 2:
-            Ks = np.repeat(Ks[np.newaxis], batch_size, axis=0)
-
-        # Process each image
-        rgbddd_batch = np.zeros((batch_size, h, w, 6), dtype=np.float32)
-
-        for i in range(batch_size):
-            rgbddd_batch[i] = self.process_rgbd_to_rgbddd(
-                rgbs[i], depths[i], Ks[i], normalize_xyz
-            )
-
-        return rgbddd_batch
-
-    def prepare_model_input(self, real_rgbddd: np.ndarray,
-                           rendered_rgbddd: np.ndarray) -> dict:
-        """
-        Prepare final input dict for models.
-
-        Args:
-            real_rgbddd: (H, W, 6) or (1, H, W, 6) real image
-            rendered_rgbddd: (N, H, W, 6) rendered hypotheses
-
-        Returns:
-            Dict with 'input1' and 'input2' for model
-        """
-        # Ensure batch dimensions
-        if real_rgbddd.ndim == 3:
-            real_rgbddd = real_rgbddd[np.newaxis]
-
-        # Expand real to match rendered batch size
-        batch_size = len(rendered_rgbddd)
-        if len(real_rgbddd) == 1 and batch_size > 1:
-            real_rgbddd = np.repeat(real_rgbddd, batch_size, axis=0)
-
-        return {
-            'input1': real_rgbddd,      # Real observation
-            'input2': rendered_rgbddd   # Rendered hypotheses
-        }
+        return np.concatenate([rgb_norm, xyz], axis=-1).astype(np.float32)
 
 
-# Unit tests
-if __name__ == "__main__":
+if __name__ == '__main__':
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
-    from pathlib import Path
-    import cv2
-
-    # Import all necessary local modules
-    # These will be found if your files are in the same directory
     try:
-        from CUDAContext import CUDAContextManager
         from DataLoader import DataLoader
+        from CropProcessor import CropProcessor
         from MeshRenderer import MeshRenderer
         from PoseGenerator import PoseGenerator
-        from CropProcessor import CropProcessor
+        from CUDAContext import CUDAContextManager
     except ImportError as e:
-        print(f"Could not import a required module: {e}")
-        print("Please ensure all script files are in the same directory.")
+        print(f"Error: A required module is missing to run the test: {e}")
         exit()
 
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
-    # --- Visualization Helper Function ---
-    def visualize_pipeline(
-        rgb_crop: np.ndarray,
-        depth_crop: np.ndarray,
-        xyz_unnormalized: np.ndarray,
-        xyz_normalized: np.ndarray,
-        title: str,
-        filename: str
-    ):
-        """Creates a comprehensive visualization for a single data pipeline."""
-        fig, axes = plt.subplots(3, 4, figsize=(18, 14))
-        fig.suptitle(title, fontsize=18, y=0.95)
+    print("="*80)
+    print("Depth Processor Standalone Test")
+    print("="*80)
 
-        # --- Row 1: Inputs and Coordinate System ---
-        # RGB Image
-        axes[0, 0].imshow(rgb_crop)
-        axes[0, 0].set_title("Input RGB (160x160)")
-        axes[0, 0].axis('off')
-
-        # Depth Image
-        depth_vis = depth_crop.copy()
-        depth_vis[depth_vis == 0] = np.nan
-        im_depth = axes[0, 1].imshow(depth_vis, cmap='viridis')
-        axes[0, 1].set_title("Input Depth (m)")
-        axes[0, 1].axis('off')
-        fig.colorbar(im_depth, ax=axes[0, 1], label="meters", fraction=0.046, pad=0.04)
-
-        # 3D Axis Reference
-        ax_3d = fig.add_subplot(3, 4, 3, projection='3d')
-        ax_3d.set_title("Camera Coordinates")
-        l = 1.0
-        ax_3d.quiver(0,0,0, l,0,0, color='r', arrow_length_ratio=0.1)
-        ax_3d.quiver(0,0,0, 0,l,0, color='g', arrow_length_ratio=0.1)
-        ax_3d.quiver(0,0,0, 0,0,l, color='b', arrow_length_ratio=0.1)
-        ax_3d.text(l, 0, 0, '+X (Right)', color='r'); ax_3d.text(0, l, 0, '+Y (Down)', color='g'); ax_3d.text(0, 0, l, '+Z (Forward)', color='b')
-        ax_3d.set_xlim(0,l); ax_3d.set_ylim(0,l); ax_3d.set_zlim(0,l)
-        ax_3d.view_init(elev=20, azim=-60); ax_3d.set_axis_off()
-        axes[0, 2].set_visible(False)
-        axes[0, 3].set_visible(False)
-
-
-        # --- Row 2: Unnormalized XYZ ---
-        vmax_abs = np.nanmax(np.abs(xyz_unnormalized))
-        labels_unnorm = ['Unnormalized X', 'Unnormalized Y', 'Unnormalized Z']
-        for i, label in enumerate(labels_unnorm):
-            ax = axes[1, i]
-            im = ax.imshow(xyz_unnormalized[:, :, i], cmap='RdBu_r', vmin=-vmax_abs, vmax=vmax_abs)
-            ax.set_title(label)
-            ax.axis('off')
-            fig.colorbar(im, ax=ax, label='meters', fraction=0.046, pad=0.04)
-        axes[1, 3].set_visible(False)
-
-        # --- Row 3: Normalized XYZ ---
-        vmax_norm = np.nanmax(np.abs(xyz_normalized))
-        labels_norm = ['Normalized X', 'Normalized Y', 'Normalized Z']
-        for i, label in enumerate(labels_norm):
-            ax = axes[2, i]
-            im = ax.imshow(xyz_normalized[:, :, i], cmap='RdBu_r', vmin=-vmax_norm, vmax=vmax_norm)
-            ax.set_title(label)
-            ax.axis('off')
-            fig.colorbar(im, ax=ax, label='normalized units', fraction=0.046, pad=0.04)
-        axes[2, 3].set_visible(False)
-
-        plt.tight_layout(rect=[0, 0, 1, 0.93])
-
-        # Save figure
-        viz_dir = Path("viz")
-        viz_dir.mkdir(exist_ok=True)
-        save_path = viz_dir / filename
-        plt.savefig(save_path, dpi=150)
-        print(f"\n✅ Visualization saved to: {save_path}")
-        plt.close(fig)
-
-
-    # --- Main Execution Block ---
     manager = None
     try:
-        print("="*80)
-        print("Depth Processor Unit Tests")
-        print("="*80)
-
-        # Initialize CUDA context and processors
-        print("Initializing CUDA context and data loaders...")
+        # --- Initialization ---
         manager = CUDAContextManager.get_instance()
-        processor = DepthProcessor()
         loader = DataLoader("./data")
-        crop_proc = CropProcessor()
-
-        # --- Pipeline 1: Real Data ---
-        print("\n--- Starting Real Data Pipeline ---")
-        scenes = loader.get_available_scenes()
-        if not scenes: raise RuntimeError("No scenes found for testing.")
-
-        data = loader.load_frame_data(scenes[0], 0)
-        mask_idx = next((i for i, m in enumerate(data['masks']) if m is not None and np.any(m)), -1)
-        if mask_idx == -1: raise RuntimeError("No valid object mask found in the test frame.")
-
-        cropped_real = crop_proc.apply_crop(data['rgb'], data['depth'], data['masks'][mask_idx], data['K'])
-
-        rgbddd_real_unnormalized = processor.process_rgbd_to_rgbddd(cropped_real['rgb'], cropped_real['depth'], cropped_real['K'], normalize_xyz=False)
-        rgbddd_real_normalized = processor.process_rgbd_to_rgbddd(cropped_real['rgb'], cropped_real['depth'], cropped_real['K'], normalize_xyz=True)
-
-        visualize_pipeline(
-            cropped_real['rgb'], cropped_real['depth'],
-            rgbddd_real_unnormalized[:, :, 3:], rgbddd_real_normalized[:, :, 3:],
-            title="Real Data Processing Pipeline",
-            filename="depth_processor_real_test.png"
-        )
-
-        # --- Pipeline 2: Synthetic Data ---
-        print("\n--- Starting Synthetic Data Pipeline ---")
-        mesh = loader.load_object_model(1)
-        pose_gen = PoseGenerator(mesh)
+        cropper = CropProcessor()
+        processor = DepthProcessor()
+        mesh = loader.load_object_model(5)
         renderer = MeshRenderer(mesh)
+        generator = PoseGenerator(mesh)
 
-        synth_pose = pose_gen.generate_poses(n_poses=1)[0]
-
-        # Render at full resolution to simulate a real capture
-        rgb_synth_full, depth_synth_full = renderer.render(synth_pose, loader.K, 640, 480)
-        mask_synth_full = (depth_synth_full > 0)
-
-        # CRITICAL FIX: Apply the *same* cropping to synthetic data
-        cropped_synth = crop_proc.apply_crop(rgb_synth_full, depth_synth_full, mask_synth_full, loader.K)
-
-        rgbddd_synth_unnormalized = processor.process_rgbd_to_rgbddd(cropped_synth['rgb'], cropped_synth['depth'], cropped_synth['K'], normalize_xyz=False)
-        rgbddd_synth_normalized = processor.process_rgbd_to_rgbddd(cropped_synth['rgb'], cropped_synth['depth'], cropped_synth['K'], normalize_xyz=True)
-
-        visualize_pipeline(
-            cropped_synth['rgb'], cropped_synth['depth'],
-            rgbddd_synth_unnormalized[:, :, 3:], rgbddd_synth_normalized[:, :, 3:],
-            title="Synthetic Data Processing Pipeline",
-            filename="depth_processor_synthetic_test.png"
+        # --- Test 1: Real Data Pipeline ---
+        print("\n--- Testing with REAL data ---")
+        scene_id = loader.get_available_scenes()[0]
+        frame_id = loader.get_scene_frames(scene_id)[0]
+        data = loader.load_frame_data(scene_id, frame_id)
+        cropped_data = cropper.apply_crop(data['rgb'], data['depth'], data['masks'][1], data['K'])
+        rgbddd_real = processor.process_rgbd_to_rgbddd(
+            cropped_data['rgb'], cropped_data['depth'], cropped_data['K']
         )
+        print("Successfully processed real data.")
+
+        # --- Test 2: Synthetic Data Pipeline ---
+        print("\n--- Testing with SYNTHETIC data ---")
+        pose = generator.generate_poses(n_poses=1)[0]
+        rgb_synth, depth_synth = renderer.render(pose, loader.K, 640, 480)
+        mask_synth = depth_synth > 0
+        cropped_synth = cropper.apply_crop(rgb_synth, depth_synth, mask_synth, loader.K)
+        rgbddd_synth = processor.process_rgbd_to_rgbddd(
+            cropped_synth['rgb'], cropped_synth['depth'], cropped_synth['K']
+        )
+        print("Successfully processed synthetic data.")
+
+        # --- Visualization ---
+        for i, (rgbddd, label) in enumerate([(rgbddd_real, "Real"), (rgbddd_synth, "Synthetic")]):
+            fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+            fig.suptitle(f'DepthProcessor Verification: {label} Data', fontsize=16)
+
+            rgb = (rgbddd[:, :, :3] * 255).astype(np.uint8)
+            xyz = rgbddd[:, :, 3:]
+            vmax_xy = np.nanmax(np.abs(xyz[:,:,:2]))
+
+            axes[0].imshow(rgb); axes[0].set_title("RGB Component"); axes[0].axis('off')
+
+            # Use diverging colormap for X and Y, centered at 0
+            im_x = axes[1].imshow(xyz[:,:,0], cmap='RdBu_r', vmin=-vmax_xy, vmax=vmax_xy)
+            axes[1].set_title("X (meters)"); axes[1].axis('off'); fig.colorbar(im_x, ax=axes[1])
+
+            im_y = axes[2].imshow(xyz[:,:,1], cmap='RdBu_r', vmin=-vmax_xy, vmax=vmax_xy)
+            axes[2].set_title("Y (meters)"); axes[2].axis('off'); fig.colorbar(im_y, ax=axes[2])
+
+            # --- VISUALIZATION FIX ---
+            # Use the same RdBu_r colormap for Z as requested for consistency.
+            # Since Z is always positive, it will only show the "red" part of the map.
+            z_channel = xyz[:,:,2]
+            im_z = axes[3].imshow(z_channel, cmap='RdBu_r', vmin=0)
+            axes[3].set_title("Z (meters)"); axes[3].axis('off'); fig.colorbar(im_z, ax=axes[3])
+
+            plt.tight_layout(rect=[0, 0, 1, 0.93])
+            save_path = Path("viz") / f'depthprocessor_test_{label.lower()}.png'
+            save_path.parent.mkdir(exist_ok=True)
+            plt.savefig(save_path, dpi=150)
+            print(f"Saved {label} data visualization to {save_path}")
+
+        print("\n" + "="*80)
+        print("DepthProcessor test completed successfully!")
+        print("="*80)
 
     except Exception as e:
-        logging.error(f"An error occurred during the test: {e}", exc_info=True)
+        logging.error(f"An error occurred during the standalone test: {e}", exc_info=True)
     finally:
-        # Guarantee that the CUDA context is cleaned up
         if manager:
             print("\nCleaning up CUDA context...")
             manager.cleanup()
-
-    print("\n" + "="*80)
-    print("All tests complete.")
-    print("="*80)
