@@ -1,17 +1,5 @@
-# Python-generated files
-__pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
-
-# uv and zed
+__pycache__
 .venv
 uv.lock
-.ropeproject
-
-# project specific
 data/
 models/
-.DS_Store
